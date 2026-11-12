@@ -42,3 +42,19 @@ def test_zero_denominator_is_masked_not_nan() -> None:
 def test_shape_mismatch_raises() -> None:
     with pytest.raises(ValueError, match="shape mismatch"):
         normalized_difference(_ma([1.0, 2.0]), _ma([1.0]))
+
+
+@pytest.mark.req("R1")
+def test_negative_reflectance_is_clipped_so_ndvi_stays_bounded() -> None:
+    nir, red = _ma([0.03]), _ma([-0.02])  # a dark pixel after the L2A offset
+    assert float(normalized_difference(nir, red, clip_min=None)[0]) == pytest.approx(5.0, rel=1e-3)
+    assert float(ndvi(nir, red)[0]) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.req("R1")
+def test_ndvi_is_always_within_minus_one_and_one() -> None:
+    rng = np.random.default_rng(0)
+    nir = np.ma.masked_array(rng.uniform(-0.1, 0.6, 5000).astype("float32"))
+    red = np.ma.masked_array(rng.uniform(-0.1, 0.6, 5000).astype("float32"))
+    values = ndvi(nir, red).compressed()
+    assert values.min() >= -1.0 and values.max() <= 1.0

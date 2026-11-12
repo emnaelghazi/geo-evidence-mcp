@@ -36,9 +36,15 @@ def test_live_tozeur_ndvi_is_plausible() -> None:
     assert red.scale == pytest.approx(1e-4)
     assert red.offset in (0.0, -0.1)
 
-    stats = zonal_stats(ndvi(nir.values, red.values), red.transform, red.crs)
+    index = ndvi(nir.values, red.values)
+    stats = zonal_stats(index, red.transform, red.crs)
     assert stats.valid_fraction > 0.8
     assert stats.min is not None and stats.max is not None
-    assert -1.0 <= stats.min <= stats.max <= 1.0
-    assert stats.max > 0.3, "no vegetated pixels: the AOI box probably misses the oasis"
-    assert stats.min < 0.2, "no bare ground: the AOI box probably sits entirely inside the oasis"
+    assert -1.0 <= stats.min <= stats.max <= 1.0, (
+        "NDVI out of range: check scale/offset and clipping"
+    )
+
+    values = index.compressed()
+    high, low = float((values > 0.4).mean()), float((values < 0.15).mean())
+    assert high >= 0.05, f"only {high:.1%} vegetated pixels: the AOI box misses the oasis"
+    assert low >= 0.05, f"only {low:.1%} bare-ground pixels: shift the box to include desert"

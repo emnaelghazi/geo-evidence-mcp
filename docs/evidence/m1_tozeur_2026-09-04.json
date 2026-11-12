@@ -1,0 +1,56 @@
+{
+  "aoi": {
+    "west": 8.137,
+    "south": 33.893,
+    "east": 8.159,
+    "north": 33.911
+  },
+  "scene": {
+    "item_id": "S2C_32SMC_20260904_0_L2A",
+    "datetime": "2026-09-04T10:21:26.934000+00:00",
+    "cloud_cover": 0.66604,
+    "processing_baseline": "05.12",
+    "red_href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/32/S/MC/2026/9/S2C_32SMC_20260904_0_L2A/B04.tif",
+    "nir_href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/32/S/MC/2026/9/S2C_32SMC_20260904_0_L2A/B08.tif",
+    "crs": "EPSG:32632"
+  },
+  "ndvi": {
+    "total_pixels": 41612,
+    "valid_pixels": 41612,
+    "valid_fraction": 1.0,
+    "mean": 0.7222074312888448,
+    "median": 0.8852105140686035,
+    "std": 0.33037207660151224,
+    "min": -0.020881609991192818,
+    "max": 1.0
+  },
+  "negative_reflectance_fraction": 0.3840238392771316,
+  "fraction_above_0_4": 0.7742958761895608,
+  "fraction_below_0_15": 0.10989618379313659,
+  "samples": [
+    {
+      "label": "lowest NDVI",
+      "lon": 8.146829,
+      "lat": 33.907388,
+      "red_dn": 5400,
+      "nir_dn": 5220,
+      "ndvi": -0.0209
+    },
+    {
+      "label": "median NDVI",
+      "lon": 8.141006,
+      "lat": 33.894811,
+      "red_dn": 1163,
+      "nir_dn": 3677,
+      "ndvi": 0.8852
+    },
+    {
+      "label": "highest NDVI",
+      "lon": 8.137598,
+      "lat": 33.911021,
+      "red_dn": 877,
+      "nir_dn": 3333,
+      "ndvi": 1.0
+    }
+  ]
+}
