@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: lint, types, tests (R13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest
+      # M6 (R10): add `make eval-fast` here once the eval runner exists.
+
+  stack-smoke:
+    name: compose builds, PostGIS + pgvector load (R12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv sync --locked
+      - run: uv run gem-init-env
+      - name: Validate both compose files
+        run: docker compose -f docker-compose.yml -f docker-compose.langfuse.yml config -q
+      - name: Start database
+        run: docker compose up -d --build --wait db
+      - name: Assert extensions and versions
+        run: |
+          docker compose exec -T db psql -U gem -d gem -tA -c \
+            "select extname || ' ' || extversion from pg_extension where extname in ('postgis','vector') order by 1" \
+            | tee /tmp/ext.txt
+          grep -q '^postgis 3\.4' /tmp/ext.txt
+          grep -q '^vector 0\.7' /tmp/ext.txt
+      - if: always()
+        run: docker compose down -v

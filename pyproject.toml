@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "geo-evidence-mcp"
+version = "0.0.1"
+description = "MCP server and agent for Earth-observation questions whose every answer ships with machine-checkable provenance."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Emna El Ghazi" }]
+# Dependencies are pinned exactly and added milestone by milestone (see ADR-001).
+# Candidates verified on PyPI on 2026-11-11, to be added where first used:
+#   M1 (added): pystac-client, rasterio, numpy, shapely
+#   later: odc-stac==0.5.3 + xarray==2026.9.0 for multi-scene stacks (change_detect), see ADR-003;
+#          rio-tiler==9.4.13, geopandas==1.2.0 only if a milestone needs them
+#   M2: fastmcp==2.14.7  (brief says 2.x; PyPI latest is 4.1.8, see ADR-001 open question)
+#   M3: psycopg==3.3.8
+#   M4: langgraph==1.2.20, langfuse==5.2.0, anthropic==2.8.0
+dependencies = [
+  "pydantic==2.14.3",
+  "pydantic-settings==2.16.2",
+  "numpy==2.5.4",
+  "rasterio==1.5.2",
+  "shapely==2.2.0",
+  "pystac==1.16.0",
+  "pystac-client==0.9.1",
+  "affine==3.0.1",
+]
+
+[project.scripts]
+gem-init-env = "geo_evidence_mcp.init_env:main"
+gem-m1-check = "geo_evidence_mcp.m1_check:main"
+
+[dependency-groups]
+dev = [
+  "pytest==9.2.0",
+  "ruff==0.17.4",
+  "mypy==2.4.1",
+  "pre-commit==4.7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/geo_evidence_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "req(id): maps a test to a requirement ID (R1-R17) from the project brief",
+  "integration: hits live services (needs network); run with RUN_INTEGRATION=1",
+]
+
+[[tool.mypy.overrides]]
+module = ["rasterio.*", "shapely.*", "affine.*"]
+ignore_missing_imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# CLI report text: long print lines are clearer than wrapped ones.
+"src/geo_evidence_mcp/m1_check.py" = ["E501"]
