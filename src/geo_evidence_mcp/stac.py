@@ -105,6 +105,32 @@ def summarize_item(item: pystac.Item) -> SceneSummary:
     )
 
 
+def _active_client(client: StacClientLike | None, settings: Settings | None) -> StacClientLike:
+    if client is not None:
+        return client
+    return pystac_client.Client.open((settings or get_settings()).stac_endpoint)
+
+
+def fetch_scene(
+    item_id: str,
+    *,
+    collection: str = "sentinel-2-l2a",
+    client: StacClientLike | None = None,
+    settings: Settings | None = None,
+) -> SceneSummary:
+    """Look one scene up by id (the server is stateless: tools take ids, not objects).
+
+    TODO(M2 verify, live): confirm Earth Search v1 honours `ids` in item search.
+    """
+    search = _active_client(client, settings).search(
+        collections=[collection], ids=[item_id], max_items=1
+    )
+    for item in search.items():
+        if item.id == item_id:
+            return summarize_item(item)
+    raise LookupError(f"no item {item_id!r} in collection {collection!r}")
+
+
 def search_stac(
     bbox: BBox,
     start: date,
@@ -124,12 +150,7 @@ def search_stac(
     """
     if start > end:
         raise ValueError("start must not be after end")
-    active: StacClientLike = (
-        client
-        if client is not None
-        else pystac_client.Client.open((settings or get_settings()).stac_endpoint)
-    )
-    search = active.search(
+    search = _active_client(client, settings).search(
         collections=[collection],
         bbox=bbox.as_tuple,
         datetime=f"{start.isoformat()}/{end.isoformat()}",

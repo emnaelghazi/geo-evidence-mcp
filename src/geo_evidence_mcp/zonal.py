@@ -24,6 +24,23 @@ class ZonalStats(BaseModel):
     max: float | None
 
 
+def zone_mask(
+    shape: tuple[int, int],
+    transform: Affine,
+    crs: str,
+    geometry: BaseGeometry | dict[str, Any] | None = None,
+    geometry_crs: str = "EPSG:4326",
+) -> np.ndarray:
+    """Boolean array, True where a pixel centre is inside `geometry` (everywhere when None)."""
+    if geometry is None:
+        return np.ones(shape, dtype=bool)
+    geom = mapping(geometry) if isinstance(geometry, BaseGeometry) else geometry
+    if geometry_crs != crs:
+        geom = transform_geom(geometry_crs, crs, geom)
+    mask: np.ndarray = geometry_mask([geom], out_shape=shape, transform=transform, invert=True)
+    return mask
+
+
 def zonal_stats(
     values: np.ma.MaskedArray,
     transform: Affine,
@@ -38,13 +55,7 @@ def zonal_stats(
     if values.ndim != 2:
         raise ValueError("values must be a 2-D array")
     masked = np.ma.getmaskarray(values)
-    if geometry is None:
-        inside = np.ones(values.shape, dtype=bool)
-    else:
-        geom = mapping(geometry) if isinstance(geometry, BaseGeometry) else geometry
-        if geometry_crs != crs:
-            geom = transform_geom(geometry_crs, crs, geom)
-        inside = geometry_mask([geom], out_shape=values.shape, transform=transform, invert=True)
+    inside = zone_mask(values.shape, transform, crs, geometry, geometry_crs)
     total = int(inside.sum())
     selected = np.ma.getdata(values)[inside & ~masked].astype("float64")
     valid = int(selected.size)

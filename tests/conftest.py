@@ -16,11 +16,14 @@ Digital numbers carry the post-04.00 +1000 offset: reflectance = (DN - 1000) / 1
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import pystac
 import pytest
 import rasterio
 from affine import Affine
@@ -101,3 +104,52 @@ def make_scene(tmp_path: Path, *, offset: float = -0.1) -> Synthetic:
 @pytest.fixture
 def synthetic(tmp_path: Path) -> Synthetic:
     return make_scene(tmp_path)
+
+
+def scene_to_item(scene: SceneSummary) -> pystac.Item:
+    """Turn a SceneSummary back into a STAC item (for fake catalogs in server tests)."""
+    item = pystac.Item(
+        id=scene.item_id,
+        geometry=None,
+        bbox=None,
+        datetime=scene.datetime,
+        properties={
+            "eo:cloud_cover": scene.cloud_cover,
+            "s2:processing_baseline": scene.processing_baseline,
+            "proj:code": f"EPSG:{scene.epsg}",
+        },
+        collection=scene.collection,
+    )
+    for key, ref in scene.assets.items():
+        item.add_asset(
+            key,
+            pystac.Asset(
+                href=ref.href,
+                extra_fields={
+                    "raster:bands": [
+                        {"scale": ref.scale, "offset": ref.offset, "nodata": ref.nodata}
+                    ]
+                },
+            ),
+        )
+    return item
+
+
+class _FakeSearch:
+    def __init__(self, items: list[pystac.Item]) -> None:
+        self._items = items
+
+    def items(self) -> Iterator[pystac.Item]:
+        return iter(self._items)
+
+
+class FakeCatalog:
+    """Minimal STAC API stand-in: honours `ids`, otherwise returns everything it holds."""
+
+    def __init__(self, items: list[pystac.Item]) -> None:
+        self._items = items
+
+    def search(self, **kwargs: Any) -> _FakeSearch:
+        ids = kwargs.get("ids")
+        found = [i for i in self._items if ids is None or i.id in ids]
+        return _FakeSearch(found)

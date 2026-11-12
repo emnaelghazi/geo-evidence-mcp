@@ -1,6 +1,6 @@
 # ADR-001: Stack, scope and open questions
 
-- Status: Accepted, with one open question (FastMCP major version)
+- Status: Accepted; the FastMCP question is resolved in ADR-002
 - Date: 2026-11-11
 
 ## Context

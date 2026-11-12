@@ -1,0 +1,925 @@
+diff --git a/README.md b/README.md
+index c2c35e4..4d75bc9 100644
+--- a/README.md
++++ b/README.md
+@@ -4,13 +4,13 @@ An MCP server and agent for Earth-observation questions where **every numeric an
+ machine-checkable provenance**: STAC item, collection, band, CRS, acquisition time, processing level
+ and a replayable tool-call trace.
+ 
+-Status: **M1 data layer**. The MCP server, provenance persistence and agent are not built yet.
++Status: **M2 MCP server**. Provenance persistence (M3), the agent (M4) and the benchmark are not built yet.
+ 
+ | Milestone | Scope | State |
+ |---|---|---|
+ | M0 | Scaffold, compose, CI skeleton, ADR-001 | done (Docker verified in CI only) |
+-| M1 | Data layer (`search_stac`, `load_window`, `zonal_stats`) | code + synthetic tests done; live Tozeur check PENDING |
+-| M2 | FastMCP server | pending |
++| M1 | Data layer (`search_stac`, `load_window`, `zonal_stats`) | done; live Tozeur scene hand-verified (evidence in `docs/evidence/`) |
++| M2 | FastMCP server (`health`, `search_stac`, `load_window`, `band_math`, `zonal_stats`) | code + offline tests done; live MCP check PENDING |
+ | M3 | Provenance schema + persistence + claim validator | pending |
+ | M4 | LangGraph agent + Langfuse tracing | pending |
+ | M5 | Refusal / low-confidence logic | pending |
+@@ -30,6 +30,18 @@ uv run gem-m1-check # live Tozeur NDVI check (needs internet); see docs/adr/ADR-
+ RUN_INTEGRATION=1 uv run pytest -m integration
+ ```
+ 
++## Use as an MCP server (stdio)
++
++```bash
++uv run gem-mcp
++```
++
++Host configuration (untested with a real host so far):
++
++```json
++{ "mcpServers": { "geo-evidence": { "command": "uv", "args": ["--directory", "<path-to-repo>", "run", "gem-mcp"] } } }
++```
++
+ Benchmark results: **PENDING** (no real run exists yet).
+ 
+ License: MIT.
+diff --git a/docs/adr/ADR-001-stack-and-scope.md b/docs/adr/ADR-001-stack-and-scope.md
+index 05ee92f..b711805 100644
+--- a/docs/adr/ADR-001-stack-and-scope.md
++++ b/docs/adr/ADR-001-stack-and-scope.md
+@@ -1,6 +1,6 @@
+ # ADR-001: Stack, scope and open questions
+ 
+-- Status: Accepted, with one open question (FastMCP major version)
++- Status: Accepted; the FastMCP question is resolved in ADR-002
+ - Date: 2026-11-11
+ 
+ ## Context
+diff --git a/docs/adr/ADR-002-fastmcp-version-and-server-design.md b/docs/adr/ADR-002-fastmcp-version-and-server-design.md
+new file mode 100644
+index 0000000..1a20b55
+--- /dev/null
++++ b/docs/adr/ADR-002-fastmcp-version-and-server-design.md
+@@ -0,0 +1,35 @@
++# ADR-002: FastMCP version and server design
++
++- Status: Accepted (resolves the open question in ADR-001)
++- Date: 2026-11-12
++
++## Context
++
++The brief specifies FastMCP 2.x. PyPI's 2.x line ends at 2.14.7 (2026-04-13); the latest release is 4.1.8.
++M2 needs: tool registration, typed structured results, readable validation errors, and the in-process
++`Client` for tests (R2, R12).
++
++## Probe (2026-11-12, isolated venvs, Python 3.12)
++
++| | 2.14.7 | 4.1.8 |
++|---|---|---|
++| `@mcp.tool`, in-process `Client`, `structured_content` | works | works, identical output |
++| Bad-argument error | `ToolError` with validation message | same |
++| Resolves with our pins (pydantic 2.14.3, rasterio 1.5.2, ...) | yes | yes |
++| Import-time warnings | 2 authlib deprecation warnings | none seen |
++| Full project suite (55 tests, mypy --strict) | passes | passes |
++
++## Decision
++
++Pin `fastmcp==2.14.7`, as the brief says. Moving to 4.1.8 is a one-line change in `pyproject.toml`
++(then `uv lock`); the same suite passes on both. Revisit at M8 (v0.1.0), when no further API work remains.
++
++## Server design
++
++- Stateless: tools take STAC item ids and areas, never server-side handles, so any answer can be replayed.
++- Thin wrappers in `server.py` (validation, error mapping); all logic in `service.py` (plain functions).
++- Tools return summaries and statistics, never pixel arrays.
++- Expected failures (bad id, AOI outside the scene, area too large, unknown asset) become `ToolError`
++  messages the agent can read; unexpected exceptions are not masked.
++- Requests above 4,000,000 pixels (about 20 x 20 km at 10 m) are refused before any read (first step of R3).
++- `sources` in results mirrors the draft provenance schema; M3 replaces it with the full block.
+diff --git a/pyproject.toml b/pyproject.toml
+index b288df5..5cba1ed 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -26,12 +26,14 @@ dependencies = [
+   "shapely==2.2.0",
+   "pystac==1.16.0",
+   "pystac-client==0.9.1",
++  "fastmcp==2.14.7",
+   "affine==3.0.1",
+ ]
+ 
+ [project.scripts]
+ gem-init-env = "geo_evidence_mcp.init_env:main"
+ gem-m1-check = "geo_evidence_mcp.m1_check:main"
++gem-mcp = "geo_evidence_mcp.server:main"
+ 
+ [dependency-groups]
+ dev = [
+diff --git a/src/geo_evidence_mcp/raster.py b/src/geo_evidence_mcp/raster.py
+index 4bcc7a6..32b0bb9 100644
+--- a/src/geo_evidence_mcp/raster.py
++++ b/src/geo_evidence_mcp/raster.py
+@@ -61,10 +61,21 @@ def _pixel_window(src: rasterio.DatasetReader, bbox: BBox) -> tuple[Window, bool
+ 
+ 
+ def read_window(
+-    href: str, ref: AssetRef, bbox: BBox, *, item_id: str, asset_key: str
++    href: str,
++    ref: AssetRef,
++    bbox: BBox,
++    *,
++    item_id: str,
++    asset_key: str,
++    max_pixels: int | None = None,
+ ) -> WindowData:
+     with rasterio.Env(**GDAL_ENV), rasterio.open(href) as src:
+         win, clipped = _pixel_window(src, bbox)
++        if max_pixels is not None and win.width * win.height > max_pixels:
++            raise ValueError(
++                f"AOI covers {int(win.width * win.height):,} pixels, above the limit of "
++                f"{max_pixels:,}; use a smaller area"
++            )
+         raw = src.read(1, window=win, masked=True)
+         nodata = ref.nodata if ref.nodata is not None else src.nodata
+         values = np.ma.masked_array(
+@@ -89,7 +100,9 @@ def read_window(
+         )
+ 
+ 
+-def load_window(scene: SceneSummary, asset_key: str, bbox: BBox) -> WindowData:
++def load_window(
++    scene: SceneSummary, asset_key: str, bbox: BBox, *, max_pixels: int | None = None
++) -> WindowData:
+     """Read one asset of `scene` over `bbox` and convert it to physical values (float32)."""
+     try:
+         ref = scene.assets[asset_key]
+@@ -97,4 +110,6 @@ def load_window(scene: SceneSummary, asset_key: str, bbox: BBox) -> WindowData:
+         raise KeyError(
+             f"scene {scene.item_id} has no asset {asset_key!r}; available: {sorted(scene.assets)}"
+         ) from None
+-    return read_window(ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key)
++    return read_window(
++        ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key, max_pixels=max_pixels
++    )
+diff --git a/src/geo_evidence_mcp/results.py b/src/geo_evidence_mcp/results.py
+new file mode 100644
+index 0000000..4c39a25
+--- /dev/null
++++ b/src/geo_evidence_mcp/results.py
+@@ -0,0 +1,68 @@
++"""Typed tool results. `sources` mirrors the draft provenance schema (full block in M3)."""
++
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Literal
++
++from pydantic import BaseModel
++
++from geo_evidence_mcp.zonal import ZonalStats
++
++
++class SourceRef(BaseModel):
++    """One asset a number was computed from."""
++
++    item_id: str
++    collection: str
++    asset_key: str
++    band: str | None
++    href: str
++    datetime: datetime
++    processing_baseline: str | None
++    cloud_cover: float | None
++    scale: float
++    offset: float
++    nodata: float | None
++
++
++class GridInfo(BaseModel):
++    crs: str
++    bounds: tuple[float, float, float, float]  # west, south, east, north in `crs`
++    resolution: float  # pixel size in CRS units (metres for UTM)
++    height: int
++    width: int
++    clipped: bool  # True when the AOI extended past the scene and was cut
++
++
++class SceneBrief(BaseModel):
++    item_id: str
++    collection: str
++    datetime: datetime
++    cloud_cover: float | None
++    processing_baseline: str | None
++    epsg: int | None
++    assets: list[str]
++
++
++class SearchResult(BaseModel):
++    count: int
++    max_cloud: float
++    scenes: list[SceneBrief]  # least cloudy first
++
++
++class WindowResult(BaseModel):
++    sources: list[SourceRef]
++    grid: GridInfo
++    stats: ZonalStats  # of the physical values (reflectance for optical bands)
++
++
++class IndexResult(BaseModel):
++    index: Literal["ndvi", "ndwi"]
++    formula: str
++    clip_min: float  # reflectance is clipped to this value before the ratio
++    zone: Literal["bbox", "polygon"]
++    sources: list[SourceRef]
++    grid: GridInfo
++    negative_reflectance_fraction: float  # share of in-zone pixels clipped (either band < 0)
++    stats: ZonalStats
+diff --git a/src/geo_evidence_mcp/server.py b/src/geo_evidence_mcp/server.py
+new file mode 100644
+index 0000000..8583d8c
+--- /dev/null
++++ b/src/geo_evidence_mcp/server.py
+@@ -0,0 +1,135 @@
++"""FastMCP server (R1, M2): validation and error mapping only; logic lives in service.py."""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from datetime import date
++from typing import Annotated, Any, Literal
++
++from fastmcp import FastMCP
++from fastmcp.exceptions import ToolError
++from pydantic import Field
++from pystac_client.exceptions import APIError
++
++from geo_evidence_mcp import __version__, service
++from geo_evidence_mcp.config import get_settings
++from geo_evidence_mcp.models import BBox
++from geo_evidence_mcp.results import IndexResult, SearchResult, WindowResult
++from geo_evidence_mcp.stac import StacClientLike
++
++BBoxArg = Annotated[
++    list[float],
++    Field(min_length=4, max_length=4, description="[west, south, east, north], EPSG:4326 degrees"),
++]
++IndexArg = Annotated[Literal["ndvi", "ndwi"], Field(description="Spectral index to compute")]
++ItemIdArg = Annotated[str, Field(description="STAC item id, e.g. from search_stac")]
++GeometryArg = Annotated[
++    dict[str, Any], Field(description="GeoJSON Polygon or MultiPolygon geometry in EPSG:4326")
++]
++
++INSTRUCTIONS = (
++    "Earth-observation tools over Sentinel-2 L2A. Every numeric result lists the exact scene, "
++    "bands, scale/offset and pixel grid it was computed from. Quote numbers only as returned; "
++    "if a tool refuses or returns no data, say so instead of estimating."
++)
++
++
++def _guard[T](fn: Callable[[], T]) -> T:
++    """Turn expected failures into clean tool errors the agent can read and act on."""
++    try:
++        return fn()
++    except (ValueError, LookupError, NotImplementedError, OSError, APIError) as exc:
++        raise ToolError(str(exc)) from exc
++
++
++def _bbox(values: list[float]) -> BBox:
++    return BBox(west=values[0], south=values[1], east=values[2], north=values[3])
++
++
++def build_server(client: StacClientLike | None = None) -> FastMCP:
++    """Create the server. `client` lets tests inject a fake STAC API."""
++    mcp = FastMCP("geo-evidence-mcp", instructions=INSTRUCTIONS)
++
++    @mcp.tool
++    def health() -> dict[str, str]:
++        """Report server status and configuration (no network access, no secrets)."""
++        return {
++            "status": "ok",
++            "version": __version__,
++            "stac_endpoint": get_settings().stac_endpoint,
++        }
++
++    @mcp.tool
++    def search_stac(
++        bbox: BBoxArg,
++        start: date,
++        end: date,
++        max_cloud: Annotated[float, Field(ge=0, le=100, description="Max cloud cover, %")] = 20.0,
++        limit: Annotated[int, Field(ge=1, le=100)] = 20,
++        collection: str = service.DEFAULT_COLLECTION,
++    ) -> SearchResult:
++        """Find Sentinel-2 scenes over an area and period, least cloudy first."""
++        return _guard(
++            lambda: service.search(
++                _bbox(bbox),
++                start,
++                end,
++                max_cloud=max_cloud,
++                limit=limit,
++                collection=collection,
++                client=client,
++            )
++        )
++
++    @mcp.tool
++    def load_window(
++        item_id: ItemIdArg,
++        asset_key: Annotated[str, Field(description="Asset key such as red, nir, green, scl")],
++        bbox: BBoxArg,
++        collection: str = service.DEFAULT_COLLECTION,
++    ) -> WindowResult:
++        """Read one band over an area; returns grid info and summary statistics, not pixels."""
++        return _guard(
++            lambda: service.window(
++                item_id, asset_key, _bbox(bbox), collection=collection, client=client
++            )
++        )
++
++    @mcp.tool
++    def band_math(
++        item_id: ItemIdArg,
++        index: IndexArg,
++        bbox: BBoxArg,
++        collection: str = service.DEFAULT_COLLECTION,
++    ) -> IndexResult:
++        """Compute NDVI or NDWI for a scene over a bounding box, with summary statistics."""
++        return _guard(
++            lambda: service.index_stats(
++                item_id, index, bbox=_bbox(bbox), collection=collection, client=client
++            )
++        )
++
++    @mcp.tool
++    def zonal_stats(
++        item_id: ItemIdArg,
++        index: IndexArg,
++        geometry: GeometryArg,
++        collection: str = service.DEFAULT_COLLECTION,
++    ) -> IndexResult:
++        """Compute NDVI or NDWI statistics inside a polygon (pixel centres inside the polygon)."""
++        return _guard(
++            lambda: service.index_stats(
++                item_id, index, geometry=geometry, collection=collection, client=client
++            )
++        )
++
++    return mcp
++
++
++def main() -> int:
++    build_server().run()  # stdio transport
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/geo_evidence_mcp/service.py b/src/geo_evidence_mcp/service.py
+new file mode 100644
+index 0000000..1031dde
+--- /dev/null
++++ b/src/geo_evidence_mcp/service.py
+@@ -0,0 +1,166 @@
++"""Tool logic as plain functions (R1). The MCP layer in server.py only wraps these."""
++
++from __future__ import annotations
++
++from datetime import date
++from typing import Any, Literal
++
++import numpy as np
++from shapely.geometry import shape
++
++from geo_evidence_mcp.indices import normalized_difference
++from geo_evidence_mcp.models import BBox, SceneSummary
++from geo_evidence_mcp.raster import WindowData, load_window
++from geo_evidence_mcp.results import (
++    GridInfo,
++    IndexResult,
++    SceneBrief,
++    SearchResult,
++    SourceRef,
++    WindowResult,
++)
++from geo_evidence_mcp.stac import (
++    S2_BAND_TO_ASSET,
++    StacClientLike,
++    fetch_scene,
++)
++from geo_evidence_mcp.stac import search_stac as _search_stac
++from geo_evidence_mcp.zonal import ZonalStats, zonal_stats, zone_mask
++
++DEFAULT_COLLECTION = "sentinel-2-l2a"
++MAX_WINDOW_PIXELS = 4_000_000  # about 20 x 20 km at 10 m; larger requests are refused
++
++CLIP_MIN = 0.0
++# index -> (formula, first asset, second asset): (first - second) / (first + second)
++INDICES: dict[str, tuple[str, str, str]] = {
++    "ndvi": ("(nir - red) / (nir + red)", "nir", "red"),
++    "ndwi": ("(green - nir) / (green + nir)", "green", "nir"),
++}
++_ASSET_TO_BAND = {asset: band for band, asset in S2_BAND_TO_ASSET.items()}
++
++
++def _source(scene: SceneSummary, asset_key: str) -> SourceRef:
++    ref = scene.assets[asset_key]
++    return SourceRef(
++        item_id=scene.item_id,
++        collection=scene.collection,
++        asset_key=asset_key,
++        band=_ASSET_TO_BAND.get(asset_key),
++        href=ref.href,
++        datetime=scene.datetime,
++        processing_baseline=scene.processing_baseline,
++        cloud_cover=scene.cloud_cover,
++        scale=ref.scale,
++        offset=ref.offset,
++        nodata=ref.nodata,
++    )
++
++
++def _grid(window: WindowData) -> GridInfo:
++    height, width = window.values.shape
++    return GridInfo(
++        crs=window.crs,
++        bounds=window.bounds,
++        resolution=window.resolution[0],
++        height=height,
++        width=width,
++        clipped=window.clipped,
++    )
++
++
++def search(
++    bbox: BBox,
++    start: date,
++    end: date,
++    *,
++    max_cloud: float = 20.0,
++    limit: int = 20,
++    collection: str = DEFAULT_COLLECTION,
++    client: StacClientLike | None = None,
++) -> SearchResult:
++    scenes = _search_stac(
++        bbox, start, end, collection=collection, max_cloud=max_cloud, limit=limit, client=client
++    )
++    return SearchResult(
++        count=len(scenes),
++        max_cloud=max_cloud,
++        scenes=[
++            SceneBrief(
++                item_id=s.item_id,
++                collection=s.collection,
++                datetime=s.datetime,
++                cloud_cover=s.cloud_cover,
++                processing_baseline=s.processing_baseline,
++                epsg=s.epsg,
++                assets=sorted(s.assets),
++            )
++            for s in scenes
++        ],
++    )
++
++
++def window(
++    item_id: str,
++    asset_key: str,
++    bbox: BBox,
++    *,
++    collection: str = DEFAULT_COLLECTION,
++    client: StacClientLike | None = None,
++) -> WindowResult:
++    scene = fetch_scene(item_id, collection=collection, client=client)
++    data = load_window(scene, asset_key, bbox, max_pixels=MAX_WINDOW_PIXELS)
++    return WindowResult(
++        sources=[_source(scene, asset_key)],
++        grid=_grid(data),
++        stats=zonal_stats(data.values, data.transform, data.crs),
++    )
++
++
++def _geometry_bbox(geometry: dict[str, Any]) -> BBox:
++    geom = shape(geometry)
++    if geom.geom_type not in ("Polygon", "MultiPolygon"):
++        raise ValueError(f"geometry must be a Polygon or MultiPolygon, got {geom.geom_type}")
++    if geom.is_empty or not geom.is_valid:
++        raise ValueError("geometry is empty or invalid")
++    west, south, east, north = geom.bounds
++    return BBox(west=west, south=south, east=east, north=north)
++
++
++def index_stats(
++    item_id: str,
++    index: Literal["ndvi", "ndwi"],
++    *,
++    bbox: BBox | None = None,
++    geometry: dict[str, Any] | None = None,
++    collection: str = DEFAULT_COLLECTION,
++    client: StacClientLike | None = None,
++) -> IndexResult:
++    """Spectral-index statistics for a scene over a bbox, or inside a polygon (EPSG:4326)."""
++    if (bbox is None) == (geometry is None):
++        raise ValueError("provide exactly one of bbox or geometry")
++    if index not in INDICES:
++        raise ValueError(f"unknown index {index!r}; choose from {sorted(INDICES)}")
++    formula, first_key, second_key = INDICES[index]
++    aoi = bbox if bbox is not None else _geometry_bbox(geometry or {})
++
++    scene = fetch_scene(item_id, collection=collection, client=client)
++    first = load_window(scene, first_key, aoi, max_pixels=MAX_WINDOW_PIXELS)
++    second = load_window(scene, second_key, aoi, max_pixels=MAX_WINDOW_PIXELS)
++    if first.transform != second.transform or first.values.shape != second.values.shape:
++        raise ValueError(f"{first_key} and {second_key} are on different pixel grids")
++
++    values = normalized_difference(first.values, second.values, clip_min=CLIP_MIN)
++    inside = zone_mask(values.shape, first.transform, first.crs, geometry)
++    counted = inside & ~np.ma.getmaskarray(values)
++    negative = (np.ma.getdata(first.values) < 0) | (np.ma.getdata(second.values) < 0)
++    stats: ZonalStats = zonal_stats(values, first.transform, first.crs, geometry)
++    return IndexResult(
++        index=index,
++        formula=formula,
++        clip_min=CLIP_MIN,
++        zone="polygon" if geometry is not None else "bbox",
++        sources=[_source(scene, first_key), _source(scene, second_key)],
++        grid=_grid(first),
++        negative_reflectance_fraction=float(negative[counted].mean()) if counted.any() else 0.0,
++        stats=stats,
++    )
+diff --git a/src/geo_evidence_mcp/stac.py b/src/geo_evidence_mcp/stac.py
+index ee1583c..a26c6a9 100644
+--- a/src/geo_evidence_mcp/stac.py
++++ b/src/geo_evidence_mcp/stac.py
+@@ -105,6 +105,32 @@ def summarize_item(item: pystac.Item) -> SceneSummary:
+     )
+ 
+ 
++def _active_client(client: StacClientLike | None, settings: Settings | None) -> StacClientLike:
++    if client is not None:
++        return client
++    return pystac_client.Client.open((settings or get_settings()).stac_endpoint)
++
++
++def fetch_scene(
++    item_id: str,
++    *,
++    collection: str = "sentinel-2-l2a",
++    client: StacClientLike | None = None,
++    settings: Settings | None = None,
++) -> SceneSummary:
++    """Look one scene up by id (the server is stateless: tools take ids, not objects).
++
++    TODO(M2 verify, live): confirm Earth Search v1 honours `ids` in item search.
++    """
++    search = _active_client(client, settings).search(
++        collections=[collection], ids=[item_id], max_items=1
++    )
++    for item in search.items():
++        if item.id == item_id:
++            return summarize_item(item)
++    raise LookupError(f"no item {item_id!r} in collection {collection!r}")
++
++
+ def search_stac(
+     bbox: BBox,
+     start: date,
+@@ -124,12 +150,7 @@ def search_stac(
+     """
+     if start > end:
+         raise ValueError("start must not be after end")
+-    active: StacClientLike = (
+-        client
+-        if client is not None
+-        else pystac_client.Client.open((settings or get_settings()).stac_endpoint)
+-    )
+-    search = active.search(
++    search = _active_client(client, settings).search(
+         collections=[collection],
+         bbox=bbox.as_tuple,
+         datetime=f"{start.isoformat()}/{end.isoformat()}",
+diff --git a/src/geo_evidence_mcp/zonal.py b/src/geo_evidence_mcp/zonal.py
+index af5a60c..243e90f 100644
+--- a/src/geo_evidence_mcp/zonal.py
++++ b/src/geo_evidence_mcp/zonal.py
+@@ -24,6 +24,23 @@ class ZonalStats(BaseModel):
+     max: float | None
+ 
+ 
++def zone_mask(
++    shape: tuple[int, int],
++    transform: Affine,
++    crs: str,
++    geometry: BaseGeometry | dict[str, Any] | None = None,
++    geometry_crs: str = "EPSG:4326",
++) -> np.ndarray:
++    """Boolean array, True where a pixel centre is inside `geometry` (everywhere when None)."""
++    if geometry is None:
++        return np.ones(shape, dtype=bool)
++    geom = mapping(geometry) if isinstance(geometry, BaseGeometry) else geometry
++    if geometry_crs != crs:
++        geom = transform_geom(geometry_crs, crs, geom)
++    mask: np.ndarray = geometry_mask([geom], out_shape=shape, transform=transform, invert=True)
++    return mask
++
++
+ def zonal_stats(
+     values: np.ma.MaskedArray,
+     transform: Affine,
+@@ -38,13 +55,7 @@ def zonal_stats(
+     if values.ndim != 2:
+         raise ValueError("values must be a 2-D array")
+     masked = np.ma.getmaskarray(values)
+-    if geometry is None:
+-        inside = np.ones(values.shape, dtype=bool)
+-    else:
+-        geom = mapping(geometry) if isinstance(geometry, BaseGeometry) else geometry
+-        if geometry_crs != crs:
+-            geom = transform_geom(geometry_crs, crs, geom)
+-        inside = geometry_mask([geom], out_shape=values.shape, transform=transform, invert=True)
++    inside = zone_mask(values.shape, transform, crs, geometry, geometry_crs)
+     total = int(inside.sum())
+     selected = np.ma.getdata(values)[inside & ~masked].astype("float64")
+     valid = int(selected.size)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 27b359b..71356e1 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -16,11 +16,14 @@ Digital numbers carry the post-04.00 +1000 offset: reflectance = (DN - 1000) / 1
+ from __future__ import annotations
+ 
+ import math
++from collections.abc import Iterator
+ from dataclasses import dataclass
+ from datetime import UTC, datetime
+ from pathlib import Path
++from typing import Any
+ 
+ import numpy as np
++import pystac
+ import pytest
+ import rasterio
+ from affine import Affine
+@@ -101,3 +104,52 @@ def make_scene(tmp_path: Path, *, offset: float = -0.1) -> Synthetic:
+ @pytest.fixture
+ def synthetic(tmp_path: Path) -> Synthetic:
+     return make_scene(tmp_path)
++
++
++def scene_to_item(scene: SceneSummary) -> pystac.Item:
++    """Turn a SceneSummary back into a STAC item (for fake catalogs in server tests)."""
++    item = pystac.Item(
++        id=scene.item_id,
++        geometry=None,
++        bbox=None,
++        datetime=scene.datetime,
++        properties={
++            "eo:cloud_cover": scene.cloud_cover,
++            "s2:processing_baseline": scene.processing_baseline,
++            "proj:code": f"EPSG:{scene.epsg}",
++        },
++        collection=scene.collection,
++    )
++    for key, ref in scene.assets.items():
++        item.add_asset(
++            key,
++            pystac.Asset(
++                href=ref.href,
++                extra_fields={
++                    "raster:bands": [
++                        {"scale": ref.scale, "offset": ref.offset, "nodata": ref.nodata}
++                    ]
++                },
++            ),
++        )
++    return item
++
++
++class _FakeSearch:
++    def __init__(self, items: list[pystac.Item]) -> None:
++        self._items = items
++
++    def items(self) -> Iterator[pystac.Item]:
++        return iter(self._items)
++
++
++class FakeCatalog:
++    """Minimal STAC API stand-in: honours `ids`, otherwise returns everything it holds."""
++
++    def __init__(self, items: list[pystac.Item]) -> None:
++        self._items = items
++
++    def search(self, **kwargs: Any) -> _FakeSearch:
++        ids = kwargs.get("ids")
++        found = [i for i in self._items if ids is None or i.id in ids]
++        return _FakeSearch(found)
+diff --git a/tests/integration/test_tozeur_live.py b/tests/integration/test_tozeur_live.py
+index 078f786..6aeacb3 100644
+--- a/tests/integration/test_tozeur_live.py
++++ b/tests/integration/test_tozeur_live.py
+@@ -48,3 +48,35 @@ def test_live_tozeur_ndvi_is_plausible() -> None:
+     high, low = float((values > 0.4).mean()), float((values < 0.15).mean())
+     assert high >= 0.05, f"only {high:.1%} vegetated pixels: the AOI box misses the oasis"
+     assert low >= 0.05, f"only {low:.1%} bare-ground pixels: shift the box to include desert"
++
++
++@pytest.mark.req("R2")
++def test_live_mcp_tools_end_to_end() -> None:
++    """search_stac -> band_math through the in-process MCP client, against the real catalog."""
++    import asyncio
++    from typing import Any
++
++    from fastmcp import Client
++
++    from geo_evidence_mcp.server import build_server
++
++    start, end = date.today() - timedelta(days=90), date.today()
++
++    async def run() -> dict[str, Any]:
++        async with Client(build_server()) as client:
++            found = await client.call_tool(
++                "search_stac",
++                {"bbox": list(TOZEUR.as_tuple), "start": start.isoformat(), "end": end.isoformat()},
++            )
++            first = (found.structured_content or {})["scenes"][0]["item_id"]
++            result = await client.call_tool(
++                "band_math",
++                {"item_id": first, "index": "ndvi", "bbox": list(TOZEUR.as_tuple)},
++            )
++            content: dict[str, Any] = result.structured_content or {}
++            return content
++
++    out = asyncio.run(run())
++    assert out["sources"][0]["href"].startswith("https://"), "fetch_scene by id may be unsupported"
++    assert -1.0 <= out["stats"]["min"] <= out["stats"]["max"] <= 1.0
++    assert out["stats"]["valid_fraction"] > 0.8
+diff --git a/tests/test_server.py b/tests/test_server.py
+new file mode 100644
+index 0000000..fb7456d
+--- /dev/null
++++ b/tests/test_server.py
+@@ -0,0 +1,168 @@
++"""R1/R2: the MCP surface, exercised through FastMCP's in-process client (no network)."""
++
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++import pytest
++from fastmcp import Client
++from fastmcp.exceptions import ToolError
++
++from geo_evidence_mcp.server import build_server
++from tests.conftest import FakeCatalog, Synthetic, scene_to_item
++
++PALM_ZONE = {
++    "type": "Polygon",
++    "coordinates": [
++        [[8.1385, 33.895], [8.1425, 33.895], [8.1425, 33.909], [8.1385, 33.909], [8.1385, 33.895]]
++    ],
++}
++AOI = [8.137, 33.893, 8.159, 33.911]
++EXPECTED_TOOLS = {"health", "search_stac", "load_window", "band_math", "zonal_stats"}
++
++
++def call(synthetic: Synthetic, tool: str, args: dict[str, Any]) -> dict[str, Any]:
++    server = build_server(client=FakeCatalog([scene_to_item(synthetic.scene)]))
++
++    async def run() -> dict[str, Any]:
++        async with Client(server) as client:
++            result = await client.call_tool(tool, args)
++            assert result.structured_content is not None
++            content: dict[str, Any] = result.structured_content
++            return content
++
++    return asyncio.run(run())
++
++
++@pytest.mark.req("R1")
++def test_exposes_exactly_the_expected_tools_with_descriptions(synthetic: Synthetic) -> None:
++    server = build_server(client=FakeCatalog([]))
++
++    async def run() -> list[Any]:
++        async with Client(server) as client:
++            listed: list[Any] = list(await client.list_tools())
++            return listed
++
++    tools = asyncio.run(run())
++    assert {t.name for t in tools} == EXPECTED_TOOLS
++    assert all(t.description for t in tools)
++
++
++@pytest.mark.req("R1")
++def test_health(synthetic: Synthetic) -> None:
++    out = call(synthetic, "health", {})
++    assert out["status"] == "ok" and out["stac_endpoint"].startswith("https://")
++
++
++@pytest.mark.req("R1")
++def test_search_returns_scene_brief(synthetic: Synthetic) -> None:
++    out = call(synthetic, "search_stac", {"bbox": AOI, "start": "2026-09-01", "end": "2026-09-30"})
++    assert out["count"] == 1
++    scene = out["scenes"][0]
++    assert scene["item_id"] == "SYNTH_TOZEUR_L2A"
++    assert {"red", "nir"} <= set(scene["assets"])
++
++
++@pytest.mark.req("R1")
++def test_load_window_reports_grid_and_masked_pixels(synthetic: Synthetic) -> None:
++    out = call(
++        synthetic,
++        "load_window",
++        {"item_id": "SYNTH_TOZEUR_L2A", "asset_key": "red", "bbox": AOI},
++    )
++    grid = out["grid"]
++    assert grid["crs"] == "EPSG:32632" and grid["resolution"] == 10.0 and not grid["clipped"]
++    assert out["stats"]["valid_pixels"] == out["stats"]["total_pixels"] - 25  # the nodata hole
++    source = out["sources"][0]
++    assert (source["band"], source["scale"], source["offset"]) == ("B04", 1e-4, -0.1)
++
++
++@pytest.mark.req("R1")
++def test_band_math_ndvi_over_bbox_lists_both_sources(synthetic: Synthetic) -> None:
++    out = call(
++        synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
++    )
++    assert out["zone"] == "bbox" and out["formula"] == "(nir - red) / (nir + red)"
++    assert [s["band"] for s in out["sources"]] == ["B08", "B04"]
++    assert out["stats"]["max"] == pytest.approx(0.75, abs=1e-4)
++    assert out["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
++    assert out["negative_reflectance_fraction"] == 0.0
++    assert out["clip_min"] == 0.0
++
++
++@pytest.mark.req("R1")
++def test_zonal_stats_inside_palm_polygon(synthetic: Synthetic) -> None:
++    out = call(
++        synthetic,
++        "zonal_stats",
++        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "geometry": PALM_ZONE},
++    )
++    assert out["zone"] == "polygon"
++    assert out["stats"]["mean"] == pytest.approx(0.75, abs=1e-4)
++    assert out["stats"]["valid_fraction"] == pytest.approx(1.0)
++
++
++@pytest.mark.req("R1")
++@pytest.mark.parametrize(
++    ("tool", "args", "message"),
++    [
++        ("band_math", {"item_id": "NOPE", "index": "ndvi", "bbox": AOI}, "NOPE"),
++        ("band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "evi", "bbox": AOI}, "ndvi"),
++        ("band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": [1, 2, 3]}, "bbox"),
++        (
++            "band_math",
++            {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": [2.0, 36.0, 2.1, 36.1]},
++            "does not overlap",
++        ),
++        (
++            "zonal_stats",
++            {
++                "item_id": "SYNTH_TOZEUR_L2A",
++                "index": "ndvi",
++                "geometry": {"type": "Point", "coordinates": [8.14, 33.9]},
++            },
++            "Polygon",
++        ),
++        (
++            "load_window",
++            {"item_id": "SYNTH_TOZEUR_L2A", "asset_key": "swir16", "bbox": AOI},
++            "available",
++        ),
++    ],
++)
++def test_bad_requests_become_readable_tool_errors(
++    synthetic: Synthetic, tool: str, args: dict[str, Any], message: str
++) -> None:
++    with pytest.raises(ToolError, match=message):
++        call(synthetic, tool, args)
++
++
++@pytest.mark.req("R3")
++def test_oversized_area_is_refused(synthetic: Synthetic, monkeypatch: pytest.MonkeyPatch) -> None:
++    from geo_evidence_mcp import service
++
++    monkeypatch.setattr(service, "MAX_WINDOW_PIXELS", 1_000)
++    with pytest.raises(ToolError, match="above the limit"):
++        call(synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI})
++
++
++@pytest.mark.req("R1")
++def test_real_stdio_entrypoint_starts_and_answers() -> None:
++    """Spawn `python -m geo_evidence_mcp.server` like an MCP host would and call health."""
++    import sys
++
++    from fastmcp.client.transports import StdioTransport
++
++    transport = StdioTransport(command=sys.executable, args=["-m", "geo_evidence_mcp.server"])
++
++    async def run() -> tuple[set[str], dict[str, Any]]:
++        async with Client(transport) as client:
++            names = {t.name for t in await client.list_tools()}
++            health = await client.call_tool("health", {})
++            content: dict[str, Any] = health.structured_content or {}
++            return names, content
++
++    names, health = asyncio.run(run())
++    assert names == EXPECTED_TOOLS
++    assert health["status"] == "ok"

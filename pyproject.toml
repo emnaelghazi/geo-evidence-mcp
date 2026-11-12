@@ -26,12 +26,14 @@ dependencies = [
   "shapely==2.2.0",
   "pystac==1.16.0",
   "pystac-client==0.9.1",
+  "fastmcp==2.14.7",
   "affine==3.0.1",
 ]
 
 [project.scripts]
 gem-init-env = "geo_evidence_mcp.init_env:main"
 gem-m1-check = "geo_evidence_mcp.m1_check:main"
+gem-mcp = "geo_evidence_mcp.server:main"
 
 [dependency-groups]
 dev = [

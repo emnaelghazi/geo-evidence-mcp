@@ -61,10 +61,21 @@ def _pixel_window(src: rasterio.DatasetReader, bbox: BBox) -> tuple[Window, bool
 
 
 def read_window(
-    href: str, ref: AssetRef, bbox: BBox, *, item_id: str, asset_key: str
+    href: str,
+    ref: AssetRef,
+    bbox: BBox,
+    *,
+    item_id: str,
+    asset_key: str,
+    max_pixels: int | None = None,
 ) -> WindowData:
     with rasterio.Env(**GDAL_ENV), rasterio.open(href) as src:
         win, clipped = _pixel_window(src, bbox)
+        if max_pixels is not None and win.width * win.height > max_pixels:
+            raise ValueError(
+                f"AOI covers {int(win.width * win.height):,} pixels, above the limit of "
+                f"{max_pixels:,}; use a smaller area"
+            )
         raw = src.read(1, window=win, masked=True)
         nodata = ref.nodata if ref.nodata is not None else src.nodata
         values = np.ma.masked_array(
@@ -89,7 +100,9 @@ def read_window(
         )
 
 
-def load_window(scene: SceneSummary, asset_key: str, bbox: BBox) -> WindowData:
+def load_window(
+    scene: SceneSummary, asset_key: str, bbox: BBox, *, max_pixels: int | None = None
+) -> WindowData:
     """Read one asset of `scene` over `bbox` and convert it to physical values (float32)."""
     try:
         ref = scene.assets[asset_key]
@@ -97,4 +110,6 @@ def load_window(scene: SceneSummary, asset_key: str, bbox: BBox) -> WindowData:
         raise KeyError(
             f"scene {scene.item_id} has no asset {asset_key!r}; available: {sorted(scene.assets)}"
         ) from None
-    return read_window(ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key)
+    return read_window(
+        ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key, max_pixels=max_pixels
+    )

@@ -48,3 +48,35 @@ def test_live_tozeur_ndvi_is_plausible() -> None:
     high, low = float((values > 0.4).mean()), float((values < 0.15).mean())
     assert high >= 0.05, f"only {high:.1%} vegetated pixels: the AOI box misses the oasis"
     assert low >= 0.05, f"only {low:.1%} bare-ground pixels: shift the box to include desert"
+
+
+@pytest.mark.req("R2")
+def test_live_mcp_tools_end_to_end() -> None:
+    """search_stac -> band_math through the in-process MCP client, against the real catalog."""
+    import asyncio
+    from typing import Any
+
+    from fastmcp import Client
+
+    from geo_evidence_mcp.server import build_server
+
+    start, end = date.today() - timedelta(days=90), date.today()
+
+    async def run() -> dict[str, Any]:
+        async with Client(build_server()) as client:
+            found = await client.call_tool(
+                "search_stac",
+                {"bbox": list(TOZEUR.as_tuple), "start": start.isoformat(), "end": end.isoformat()},
+            )
+            first = (found.structured_content or {})["scenes"][0]["item_id"]
+            result = await client.call_tool(
+                "band_math",
+                {"item_id": first, "index": "ndvi", "bbox": list(TOZEUR.as_tuple)},
+            )
+            content: dict[str, Any] = result.structured_content or {}
+            return content
+
+    out = asyncio.run(run())
+    assert out["sources"][0]["href"].startswith("https://"), "fetch_scene by id may be unsupported"
+    assert -1.0 <= out["stats"]["min"] <= out["stats"]["max"] <= 1.0
+    assert out["stats"]["valid_fraction"] > 0.8
