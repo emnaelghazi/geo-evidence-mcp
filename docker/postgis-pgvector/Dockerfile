@@ -4,11 +4,12 @@
 FROM postgis/postgis:16-3.4
 
 ARG PGVECTOR_VERSION=v0.7.4
+# OPTFLAGS="" drops -march=native, so the image also runs on a different CPU than the build host.
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential git ca-certificates postgresql-server-dev-16 \
  && git clone --branch "${PGVECTOR_VERSION}" --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
- && cd /tmp/pgvector && make && make install \
+ && cd /tmp/pgvector && make OPTFLAGS="" && make OPTFLAGS="" install \
  && apt-get purge -y --auto-remove build-essential git postgresql-server-dev-16 \
  && rm -rf /var/lib/apt/lists/* /tmp/pgvector
 

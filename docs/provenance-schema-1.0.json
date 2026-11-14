@@ -1,0 +1,455 @@
+{
+  "$defs": {
+    "Computation": {
+      "additionalProperties": false,
+      "properties": {
+        "formula": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Formula"
+        },
+        "nodata_policy": {
+          "title": "Nodata Policy",
+          "type": "string"
+        },
+        "operation": {
+          "enum": [
+            "stac_search",
+            "load_window",
+            "ndvi",
+            "ndwi"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "parameters": {
+          "additionalProperties": true,
+          "title": "Parameters",
+          "type": "object"
+        },
+        "resampling": {
+          "const": "none",
+          "default": "none",
+          "title": "Resampling",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "nodata_policy"
+      ],
+      "title": "Computation",
+      "type": "object"
+    },
+    "Output": {
+      "additionalProperties": false,
+      "description": "One number the call produced. Claims in an answer are checked against these.",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subject"
+        },
+        "unit": {
+          "enum": [
+            "index",
+            "reflectance",
+            "class",
+            "fraction",
+            "count",
+            "percent",
+            "m"
+          ],
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "unit"
+      ],
+      "title": "Output",
+      "type": "object"
+    },
+    "Request": {
+      "additionalProperties": false,
+      "description": "The tool call exactly as made: enough to run it again.",
+      "properties": {
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "args"
+      ],
+      "title": "Request",
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "description": "One asset a number was computed from.",
+      "properties": {
+        "asset_key": {
+          "title": "Asset Key",
+          "type": "string"
+        },
+        "band": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Band"
+        },
+        "cloud_cover_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cloud Cover Pct"
+        },
+        "collection": {
+          "title": "Collection",
+          "type": "string"
+        },
+        "datetime": {
+          "format": "date-time",
+          "title": "Datetime",
+          "type": "string"
+        },
+        "href": {
+          "title": "Href",
+          "type": "string"
+        },
+        "item_href": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Item Href"
+        },
+        "item_id": {
+          "title": "Item Id",
+          "type": "string"
+        },
+        "nodata": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Nodata"
+        },
+        "offset": {
+          "title": "Offset",
+          "type": "number"
+        },
+        "processing_baseline": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Processing Baseline"
+        },
+        "processing_level": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Processing Level"
+        },
+        "scale": {
+          "title": "Scale",
+          "type": "number"
+        },
+        "stac_api": {
+          "title": "Stac Api",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stac_api",
+        "collection",
+        "item_id",
+        "asset_key",
+        "href",
+        "datetime",
+        "scale",
+        "offset"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "Spatial": {
+      "additionalProperties": false,
+      "properties": {
+        "aoi_geometry": {
+          "additionalProperties": true,
+          "title": "Aoi Geometry",
+          "type": "object"
+        },
+        "bbox": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Bbox",
+          "type": "array"
+        },
+        "clipped": {
+          "default": false,
+          "title": "Clipped",
+          "type": "boolean"
+        },
+        "crs": {
+          "title": "Crs",
+          "type": "string"
+        },
+        "height": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Height"
+        },
+        "resolution": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolution"
+        },
+        "width": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Width"
+        }
+      },
+      "required": [
+        "crs",
+        "bbox",
+        "aoi_geometry"
+      ],
+      "title": "Spatial",
+      "type": "object"
+    },
+    "ToolInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "title": "ToolInfo",
+      "type": "object"
+    },
+    "ToolTrace": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "span_id": {
+          "title": "Span Id",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "trace_id": {
+          "title": "Trace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "trace_id",
+        "span_id",
+        "started_at",
+        "duration_ms"
+      ],
+      "title": "ToolTrace",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "args_hash": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Args Hash",
+      "type": "string"
+    },
+    "block_id": {
+      "format": "uuid",
+      "title": "Block Id",
+      "type": "string"
+    },
+    "computation": {
+      "$ref": "#/$defs/Computation"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "outputs": {
+      "items": {
+        "$ref": "#/$defs/Output"
+      },
+      "minItems": 1,
+      "title": "Outputs",
+      "type": "array"
+    },
+    "request": {
+      "$ref": "#/$defs/Request"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/Source"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "spatial": {
+      "$ref": "#/$defs/Spatial"
+    },
+    "tool": {
+      "$ref": "#/$defs/ToolInfo"
+    },
+    "tool_trace": {
+      "$ref": "#/$defs/ToolTrace"
+    }
+  },
+  "required": [
+    "block_id",
+    "generated_at",
+    "tool",
+    "request",
+    "args_hash",
+    "sources",
+    "spatial",
+    "computation",
+    "outputs",
+    "tool_trace"
+  ],
+  "title": "ProvenanceBlock",
+  "type": "object"
+}

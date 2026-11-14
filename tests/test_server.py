@@ -6,10 +6,12 @@ import asyncio
 from typing import Any
 
 import pytest
+import rasterio
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from geo_evidence_mcp.server import build_server
+from geo_evidence_mcp.store import MemoryStore, ProvenanceStore
 from tests.conftest import FakeCatalog, Synthetic, scene_to_item
 
 PALM_ZONE = {
@@ -19,11 +21,26 @@ PALM_ZONE = {
     ],
 }
 AOI = [8.137, 33.893, 8.159, 33.911]
-EXPECTED_TOOLS = {"health", "search_stac", "load_window", "band_math", "zonal_stats"}
+EXPECTED_TOOLS = {
+    "health",
+    "search_stac",
+    "load_window",
+    "band_math",
+    "zonal_stats",
+    "get_provenance",
+}
 
 
-def call(synthetic: Synthetic, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-    server = build_server(client=FakeCatalog([scene_to_item(synthetic.scene)]))
+def call(
+    synthetic: Synthetic,
+    tool: str,
+    args: dict[str, Any],
+    store: ProvenanceStore | None = None,
+) -> dict[str, Any]:
+    server = build_server(
+        client=FakeCatalog([scene_to_item(synthetic.scene)]),
+        store=store if store is not None else MemoryStore(),
+    )
 
     async def run() -> dict[str, Any]:
         async with Client(server) as client:
@@ -74,7 +91,7 @@ def test_load_window_reports_grid_and_masked_pixels(synthetic: Synthetic) -> Non
     grid = out["grid"]
     assert grid["crs"] == "EPSG:32632" and grid["resolution"] == 10.0 and not grid["clipped"]
     assert out["stats"]["valid_pixels"] == out["stats"]["total_pixels"] - 25  # the nodata hole
-    source = out["sources"][0]
+    source = out["provenance"]["sources"][0]
     assert (source["band"], source["scale"], source["offset"]) == ("B04", 1e-4, -0.1)
 
 
@@ -84,7 +101,7 @@ def test_band_math_ndvi_over_bbox_lists_both_sources(synthetic: Synthetic) -> No
         synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
     )
     assert out["zone"] == "bbox" and out["formula"] == "(nir - red) / (nir + red)"
-    assert [s["band"] for s in out["sources"]] == ["B08", "B04"]
+    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04"]
     assert out["stats"]["max"] == pytest.approx(0.75, abs=1e-4)
     assert out["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
     assert out["negative_reflectance_fraction"] == 0.0
@@ -145,6 +162,116 @@ def test_oversized_area_is_refused(synthetic: Synthetic, monkeypatch: pytest.Mon
     monkeypatch.setattr(service, "MAX_WINDOW_PIXELS", 1_000)
     with pytest.raises(ToolError, match="above the limit"):
         call(synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI})
+
+
+@pytest.mark.req("R4")
+def test_every_numeric_tool_returns_a_complete_provenance_block(synthetic: Synthetic) -> None:
+    results = {
+        "search_stac": call(
+            synthetic, "search_stac", {"bbox": AOI, "start": "2026-09-01", "end": "2026-09-30"}
+        ),
+        "load_window": call(
+            synthetic,
+            "load_window",
+            {"item_id": "SYNTH_TOZEUR_L2A", "asset_key": "red", "bbox": AOI},
+        ),
+        "band_math": call(
+            synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
+        ),
+        "zonal_stats": call(
+            synthetic,
+            "zonal_stats",
+            {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "geometry": PALM_ZONE},
+        ),
+    }
+    for tool, out in results.items():
+        block = out["provenance"]
+        assert block["tool"]["name"] == tool
+        assert block["request"]["tool"] == tool
+        assert block["args_hash"].startswith("sha256:") and len(block["args_hash"]) == 71
+        assert block["spatial"]["aoi_geometry"]["type"] == "Polygon"
+        assert block["tool_trace"]["trace_id"] and block["tool_trace"]["duration_ms"] >= 0
+        assert block["outputs"], tool
+        if tool != "search_stac":
+            src = block["sources"][0]
+            assert src["item_id"] == "SYNTH_TOZEUR_L2A" and src["processing_level"] == "L2A"
+            assert src["processing_baseline"] == "05.11" and src["href"]
+            assert block["spatial"]["crs"] == "EPSG:32632"
+            assert block["computation"]["resampling"] == "none"
+    index = results["band_math"]["provenance"]["computation"]
+    assert (
+        index["parameters"]["clip_min"] == 0.0 and index["formula"] == "(nir - red) / (nir + red)"
+    )
+
+
+@pytest.mark.req("R5")
+def test_blocks_are_stored_and_retrievable_by_id_and_trace(synthetic: Synthetic) -> None:
+    store = MemoryStore()
+    out = call(
+        synthetic,
+        "band_math",
+        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI, "run_id": "run-42"},
+        store=store,
+    )
+    block = out["provenance"]
+    assert block["tool_trace"]["run_id"] == "run-42"
+    stored = store.by_trace(block["tool_trace"]["trace_id"])
+    assert [str(b.block_id) for b in stored] == [block["block_id"]]
+    fetched = call(synthetic, "get_provenance", {"block_id": block["block_id"]}, store=store)
+    assert fetched["block"]["args_hash"] == block["args_hash"] and fetched["replay"] is None
+
+
+@pytest.mark.req("R5")
+def test_replay_matches_when_data_is_unchanged(synthetic: Synthetic) -> None:
+    store = MemoryStore()
+    out = call(
+        synthetic,
+        "band_math",
+        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
+        store=store,
+    )
+    report = call(
+        synthetic,
+        "get_provenance",
+        {"block_id": out["provenance"]["block_id"], "replay": True},
+        store=store,
+    )["replay"]
+    assert report["matches"] is True and report["compared"] > 10 and not report["mismatches"]
+    assert (
+        len(store.by_trace(out["provenance"]["tool_trace"]["trace_id"])) == 1
+    )  # replay stores nothing new
+
+
+@pytest.mark.req("R5")
+def test_replay_detects_changed_source_data(synthetic: Synthetic) -> None:
+    store = MemoryStore()
+    out = call(
+        synthetic,
+        "band_math",
+        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
+        store=store,
+    )
+    path = synthetic.scene.assets["red"].href
+    with rasterio.open(path, "r+") as dataset:
+        data = dataset.read(1)
+        data[data == 1500] = 1700  # the "palm" red band changes after the answer was given
+        dataset.write(data, 1)
+    report = call(
+        synthetic,
+        "get_provenance",
+        {"block_id": out["provenance"]["block_id"], "replay": True},
+        store=store,
+    )["replay"]
+    assert report["matches"] is False
+    assert "ndvi.max" in {m["name"] for m in report["mismatches"]}
+
+
+@pytest.mark.req("R5")
+def test_unknown_block_id_is_a_readable_error(synthetic: Synthetic) -> None:
+    with pytest.raises(ToolError, match="no provenance block"):
+        call(synthetic, "get_provenance", {"block_id": "12345678-1234-5678-1234-567812345678"})
+    with pytest.raises(ToolError, match="badly formed"):
+        call(synthetic, "get_provenance", {"block_id": "not-a-uuid"})
 
 
 @pytest.mark.req("R1")

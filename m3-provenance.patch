@@ -1,0 +1,2265 @@
+diff --git a/.env.example b/.env.example
+index c7564a8..eb26884 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,6 +12,9 @@ POSTGRES_DB=gem
+ DB_HOST=localhost
+ DB_PORT=5432
+ 
++# --- Provenance storage: memory | postgres (use postgres after `make up`) ---
++STORE_BACKEND=memory
++
+ # --- STAC ---
+ STAC_ENDPOINT=https://earth-search.aws.element84.com/v1
+ 
+diff --git a/Makefile b/Makefile
+index cd3fd8b..42d6406 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-.PHONY: install init lint fmt type test check up up-obs down eval-fast eval m1-check test-live
++.PHONY: install init lint fmt type test check up up-obs down eval-fast eval m1-check test-live test-db
+ 
+ install:
+ 	uv sync
+@@ -39,3 +39,6 @@ m1-check:
+ 
+ test-live:
+ 	RUN_INTEGRATION=1 uv run pytest -m integration -s
++
++test-db:
++	uv run pytest -m db -q
+diff --git a/README.md b/README.md
+index 4d75bc9..05f62c9 100644
+--- a/README.md
++++ b/README.md
+@@ -4,14 +4,14 @@ An MCP server and agent for Earth-observation questions where **every numeric an
+ machine-checkable provenance**: STAC item, collection, band, CRS, acquisition time, processing level
+ and a replayable tool-call trace.
+ 
+-Status: **M2 MCP server**. Provenance persistence (M3), the agent (M4) and the benchmark are not built yet.
++Status: **M3 provenance**. The agent (M4) and the benchmark are not built yet.
+ 
+ | Milestone | Scope | State |
+ |---|---|---|
+ | M0 | Scaffold, compose, CI skeleton, ADR-001 | done (Docker verified in CI only) |
+ | M1 | Data layer (`search_stac`, `load_window`, `zonal_stats`) | done; live Tozeur scene hand-verified (evidence in `docs/evidence/`) |
+-| M2 | FastMCP server (`health`, `search_stac`, `load_window`, `band_math`, `zonal_stats`) | code + offline tests done; live MCP check PENDING |
+-| M3 | Provenance schema + persistence + claim validator | pending |
++| M2 | FastMCP server (`health`, `search_stac`, `load_window`, `band_math`, `zonal_stats`) | done; live MCP test passed |
++| M3 | Provenance block, PostGIS storage, `get_provenance` + replay, claim validator | code + tests done (PostgreSQL tested here); CI database job PENDING |
+ | M4 | LangGraph agent + Langfuse tracing | pending |
+ | M5 | Refusal / low-confidence logic | pending |
+ | M6 | Benchmark + eval runner | pending |
+@@ -28,6 +28,8 @@ make up             # PostGIS + pgvector
+ make up-obs         # + self-hosted Langfuse (http://localhost:3000)
+ uv run gem-m1-check # live Tozeur NDVI check (needs internet); see docs/adr/ADR-003
+ RUN_INTEGRATION=1 uv run pytest -m integration
++TEST_DATABASE_URL=postgresql://gem:<password>@localhost:5432/gem uv run pytest -m db   # after `make up`
++uv run gem-export-schema   # regenerate docs/provenance-schema-1.0.json
+ ```
+ 
+ ## Use as an MCP server (stdio)
+diff --git a/docker/postgis-pgvector/Dockerfile b/docker/postgis-pgvector/Dockerfile
+index 7eef901..3751d4b 100644
+--- a/docker/postgis-pgvector/Dockerfile
++++ b/docker/postgis-pgvector/Dockerfile
+@@ -4,11 +4,12 @@
+ FROM postgis/postgis:16-3.4
+ 
+ ARG PGVECTOR_VERSION=v0.7.4
++# OPTFLAGS="" drops -march=native, so the image also runs on a different CPU than the build host.
+ 
+ RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential git ca-certificates postgresql-server-dev-16 \
+  && git clone --branch "${PGVECTOR_VERSION}" --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
+- && cd /tmp/pgvector && make && make install \
++ && cd /tmp/pgvector && make OPTFLAGS="" && make OPTFLAGS="" install \
+  && apt-get purge -y --auto-remove build-essential git postgresql-server-dev-16 \
+  && rm -rf /var/lib/apt/lists/* /tmp/pgvector
+ 
+diff --git a/docs/adr/ADR-004-provenance-schema-and-claim-validation.md b/docs/adr/ADR-004-provenance-schema-and-claim-validation.md
+new file mode 100644
+index 0000000..2808fa6
+--- /dev/null
++++ b/docs/adr/ADR-004-provenance-schema-and-claim-validation.md
+@@ -0,0 +1,51 @@
++# ADR-004: Provenance schema, storage and claim validation
++
++- Status: Accepted
++- Date: 2026-11-14
++
++## Context
++
++R4-R6: every numeric claim needs machine-checkable provenance, the trace must be stored and replayable,
++and an answer may not state numbers that no tool produced.
++
++## Decisions
++
++**Schema.** `ProvenanceBlock` (Pydantic, `extra="forbid"`) is the source of truth;
++`docs/provenance-schema-1.0.json` is generated from it (`uv run gem-export-schema`) and a test fails
++on drift. Fields: `block_id`, `generated_at`, `tool`, `request` (the call as made), `args_hash`,
++`sources` (STAC API, collection, item, asset, band, datetime, processing level and baseline,
++cloud cover, scale, offset, nodata), `spatial` (CRS, grid bounds, the requested AOI as GeoJSON in
++EPSG:4326, resolution, size, clipped), `computation` (operation, formula, parameters, resampling,
++nodata policy), `outputs` (named, typed, unit-tagged numbers) and `tool_trace` (trace id, span id,
++optional agent run id, start, duration).
++
++**Hash.** `args_hash` is SHA-256 over canonical JSON of `{tool, args}` (sorted keys, floats rounded
++to 6 decimals), so key order and float noise do not change it.
++
++**Outputs are the unit of auditing.** Every number a tool can report (statistics, pixel counts,
++fractions, grid facts, scene cloud cover, search counts) is an `Output` with a unit
++(`index`, `reflectance`, `class`, `fraction`, `count`, `percent`, `m`). The validator only trusts these.
++
++**Storage.** PostgreSQL 16 + PostGIS: one row per block, the full block as `jsonb`, the AOI as
++`geometry(Geometry, 4326)` with a GiST index, plus indexes on `trace_id` and `args_hash`. An in-memory
++store backs tests and quick local use (`STORE_BACKEND=memory|postgres`).
++
++**Replay.** `get_provenance(block_id, replay=True)` re-executes the recorded request through the same
++service code (without storing anything) and diffs every output within rel 1e-6. A mismatch means the
++data or the code changed since the answer. A replayed `search_stac` legitimately differs once newer
++scenes exist.
++
++**Validator (R6).** `validate_claims(text, blocks)` extracts numbers from an answer and requires each
++to equal, at the precision it is written, a recorded output or the difference of two outputs of the
++same quantity from different blocks (for change claims). `%` requires a fraction or percent quantity.
++Dates, item ids, EPSG codes, band names, baseline numbers and bare years are not treated as claims.
++
++## Limits (stated, not hidden)
++
++- It checks that a number was produced by a tool, not that the sentence around it is true. "NDVI rose
++  by 0.3" passes if the difference of two blocks is 0.3, even if the blocks were for different places.
++- Rounding tolerance is half a unit in the last written digit, so "0.7" accepts 0.65 to 0.75.
++- Counts written as small integers ("2 bands") are flagged unless `ignore_integers_up_to` is set.
++- Replay proves reproducibility against today's data, not that the original data was right.
++- Negative-reflectance pixels are clipped to 0 before ratios (ADR-003 / M1 finding); the rule is
++  recorded in `computation.parameters.clip_min`, and its effect in `negative_reflectance_fraction`.
+diff --git a/docs/provenance-schema-1.0.json b/docs/provenance-schema-1.0.json
+new file mode 100644
+index 0000000..095febc
+--- /dev/null
++++ b/docs/provenance-schema-1.0.json
+@@ -0,0 +1,455 @@
++{
++  "$defs": {
++    "Computation": {
++      "additionalProperties": false,
++      "properties": {
++        "formula": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Formula"
++        },
++        "nodata_policy": {
++          "title": "Nodata Policy",
++          "type": "string"
++        },
++        "operation": {
++          "enum": [
++            "stac_search",
++            "load_window",
++            "ndvi",
++            "ndwi"
++          ],
++          "title": "Operation",
++          "type": "string"
++        },
++        "parameters": {
++          "additionalProperties": true,
++          "title": "Parameters",
++          "type": "object"
++        },
++        "resampling": {
++          "const": "none",
++          "default": "none",
++          "title": "Resampling",
++          "type": "string"
++        }
++      },
++      "required": [
++        "operation",
++        "nodata_policy"
++      ],
++      "title": "Computation",
++      "type": "object"
++    },
++    "Output": {
++      "additionalProperties": false,
++      "description": "One number the call produced. Claims in an answer are checked against these.",
++      "properties": {
++        "name": {
++          "title": "Name",
++          "type": "string"
++        },
++        "subject": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Subject"
++        },
++        "unit": {
++          "enum": [
++            "index",
++            "reflectance",
++            "class",
++            "fraction",
++            "count",
++            "percent",
++            "m"
++          ],
++          "title": "Unit",
++          "type": "string"
++        },
++        "value": {
++          "title": "Value",
++          "type": "number"
++        }
++      },
++      "required": [
++        "name",
++        "value",
++        "unit"
++      ],
++      "title": "Output",
++      "type": "object"
++    },
++    "Request": {
++      "additionalProperties": false,
++      "description": "The tool call exactly as made: enough to run it again.",
++      "properties": {
++        "args": {
++          "additionalProperties": true,
++          "title": "Args",
++          "type": "object"
++        },
++        "tool": {
++          "title": "Tool",
++          "type": "string"
++        }
++      },
++      "required": [
++        "tool",
++        "args"
++      ],
++      "title": "Request",
++      "type": "object"
++    },
++    "Source": {
++      "additionalProperties": false,
++      "description": "One asset a number was computed from.",
++      "properties": {
++        "asset_key": {
++          "title": "Asset Key",
++          "type": "string"
++        },
++        "band": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Band"
++        },
++        "cloud_cover_pct": {
++          "anyOf": [
++            {
++              "type": "number"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Cloud Cover Pct"
++        },
++        "collection": {
++          "title": "Collection",
++          "type": "string"
++        },
++        "datetime": {
++          "format": "date-time",
++          "title": "Datetime",
++          "type": "string"
++        },
++        "href": {
++          "title": "Href",
++          "type": "string"
++        },
++        "item_href": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Item Href"
++        },
++        "item_id": {
++          "title": "Item Id",
++          "type": "string"
++        },
++        "nodata": {
++          "anyOf": [
++            {
++              "type": "number"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Nodata"
++        },
++        "offset": {
++          "title": "Offset",
++          "type": "number"
++        },
++        "processing_baseline": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Processing Baseline"
++        },
++        "processing_level": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Processing Level"
++        },
++        "scale": {
++          "title": "Scale",
++          "type": "number"
++        },
++        "stac_api": {
++          "title": "Stac Api",
++          "type": "string"
++        }
++      },
++      "required": [
++        "stac_api",
++        "collection",
++        "item_id",
++        "asset_key",
++        "href",
++        "datetime",
++        "scale",
++        "offset"
++      ],
++      "title": "Source",
++      "type": "object"
++    },
++    "Spatial": {
++      "additionalProperties": false,
++      "properties": {
++        "aoi_geometry": {
++          "additionalProperties": true,
++          "title": "Aoi Geometry",
++          "type": "object"
++        },
++        "bbox": {
++          "maxItems": 4,
++          "minItems": 4,
++          "prefixItems": [
++            {
++              "type": "number"
++            },
++            {
++              "type": "number"
++            },
++            {
++              "type": "number"
++            },
++            {
++              "type": "number"
++            }
++          ],
++          "title": "Bbox",
++          "type": "array"
++        },
++        "clipped": {
++          "default": false,
++          "title": "Clipped",
++          "type": "boolean"
++        },
++        "crs": {
++          "title": "Crs",
++          "type": "string"
++        },
++        "height": {
++          "anyOf": [
++            {
++              "type": "integer"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Height"
++        },
++        "resolution": {
++          "anyOf": [
++            {
++              "type": "number"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Resolution"
++        },
++        "width": {
++          "anyOf": [
++            {
++              "type": "integer"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Width"
++        }
++      },
++      "required": [
++        "crs",
++        "bbox",
++        "aoi_geometry"
++      ],
++      "title": "Spatial",
++      "type": "object"
++    },
++    "ToolInfo": {
++      "additionalProperties": false,
++      "properties": {
++        "name": {
++          "title": "Name",
++          "type": "string"
++        },
++        "version": {
++          "title": "Version",
++          "type": "string"
++        }
++      },
++      "required": [
++        "name",
++        "version"
++      ],
++      "title": "ToolInfo",
++      "type": "object"
++    },
++    "ToolTrace": {
++      "additionalProperties": false,
++      "properties": {
++        "duration_ms": {
++          "minimum": 0,
++          "title": "Duration Ms",
++          "type": "number"
++        },
++        "run_id": {
++          "anyOf": [
++            {
++              "type": "string"
++            },
++            {
++              "type": "null"
++            }
++          ],
++          "default": null,
++          "title": "Run Id"
++        },
++        "span_id": {
++          "title": "Span Id",
++          "type": "string"
++        },
++        "started_at": {
++          "format": "date-time",
++          "title": "Started At",
++          "type": "string"
++        },
++        "trace_id": {
++          "title": "Trace Id",
++          "type": "string"
++        }
++      },
++      "required": [
++        "trace_id",
++        "span_id",
++        "started_at",
++        "duration_ms"
++      ],
++      "title": "ToolTrace",
++      "type": "object"
++    }
++  },
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "additionalProperties": false,
++  "properties": {
++    "args_hash": {
++      "pattern": "^sha256:[0-9a-f]{64}$",
++      "title": "Args Hash",
++      "type": "string"
++    },
++    "block_id": {
++      "format": "uuid",
++      "title": "Block Id",
++      "type": "string"
++    },
++    "computation": {
++      "$ref": "#/$defs/Computation"
++    },
++    "generated_at": {
++      "format": "date-time",
++      "title": "Generated At",
++      "type": "string"
++    },
++    "outputs": {
++      "items": {
++        "$ref": "#/$defs/Output"
++      },
++      "minItems": 1,
++      "title": "Outputs",
++      "type": "array"
++    },
++    "request": {
++      "$ref": "#/$defs/Request"
++    },
++    "schema_version": {
++      "const": "1.0",
++      "default": "1.0",
++      "title": "Schema Version",
++      "type": "string"
++    },
++    "sources": {
++      "items": {
++        "$ref": "#/$defs/Source"
++      },
++      "title": "Sources",
++      "type": "array"
++    },
++    "spatial": {
++      "$ref": "#/$defs/Spatial"
++    },
++    "tool": {
++      "$ref": "#/$defs/ToolInfo"
++    },
++    "tool_trace": {
++      "$ref": "#/$defs/ToolTrace"
++    }
++  },
++  "required": [
++    "block_id",
++    "generated_at",
++    "tool",
++    "request",
++    "args_hash",
++    "sources",
++    "spatial",
++    "computation",
++    "outputs",
++    "tool_trace"
++  ],
++  "title": "ProvenanceBlock",
++  "type": "object"
++}
+diff --git a/pyproject.toml b/pyproject.toml
+index 5cba1ed..dbf6243 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -27,6 +27,7 @@ dependencies = [
+   "pystac==1.16.0",
+   "pystac-client==0.9.1",
+   "fastmcp==2.14.7",
++  "psycopg[binary]==3.3.8",
+   "affine==3.0.1",
+ ]
+ 
+@@ -34,6 +35,7 @@ dependencies = [
+ gem-init-env = "geo_evidence_mcp.init_env:main"
+ gem-m1-check = "geo_evidence_mcp.m1_check:main"
+ gem-mcp = "geo_evidence_mcp.server:main"
++gem-export-schema = "geo_evidence_mcp.export_schema:main"
+ 
+ [dependency-groups]
+ dev = [
+@@ -65,6 +67,7 @@ addopts = "-ra --strict-markers"
+ markers = [
+   "req(id): maps a test to a requirement ID (R1-R17) from the project brief",
+   "integration: hits live services (needs network); run with RUN_INTEGRATION=1",
++  "db: needs PostgreSQL+PostGIS; set TEST_DATABASE_URL to run",
+ ]
+ 
+ [[tool.mypy.overrides]]
+diff --git a/src/geo_evidence_mcp/config.py b/src/geo_evidence_mcp/config.py
+index 65af936..00c3eaa 100644
+--- a/src/geo_evidence_mcp/config.py
++++ b/src/geo_evidence_mcp/config.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from functools import lru_cache
++from typing import Literal
+ from urllib.parse import quote
+ 
+ from pydantic import SecretStr
+@@ -30,6 +31,9 @@ class Settings(BaseSettings):
+     db_host: str = "localhost"
+     db_port: int = 5432
+ 
++    # Where provenance blocks are stored: "memory" (tests, quick local use) or "postgres" (R5).
++    store_backend: Literal["memory", "postgres"] = "memory"
++
+     # Data access.
+     # TODO(M1): verify the Earth Search endpoint and collection names against the live API.
+     stac_endpoint: str = "https://earth-search.aws.element84.com/v1"
+diff --git a/src/geo_evidence_mcp/export_schema.py b/src/geo_evidence_mcp/export_schema.py
+new file mode 100644
+index 0000000..c26a704
+--- /dev/null
++++ b/src/geo_evidence_mcp/export_schema.py
+@@ -0,0 +1,38 @@
++"""Write (or check) the JSON Schema generated from the provenance model."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++from geo_evidence_mcp.provenance import SCHEMA_VERSION, ProvenanceBlock
++
++SCHEMA_PATH = Path("docs") / f"provenance-schema-{SCHEMA_VERSION}.json"
++
++
++def render() -> str:
++    schema = ProvenanceBlock.model_json_schema()
++    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
++    return json.dumps(schema, indent=2, sort_keys=True) + "\n"
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--check", action="store_true", help="fail if the file is out of date")
++    args = parser.parse_args(argv)
++    expected = render()
++    if args.check:
++        current = SCHEMA_PATH.read_text(encoding="utf-8") if SCHEMA_PATH.exists() else ""
++        if current != expected:
++            print(f"{SCHEMA_PATH} is out of date; run `uv run gem-export-schema`.")
++            return 1
++        return 0
++    SCHEMA_PATH.parent.mkdir(parents=True, exist_ok=True)
++    SCHEMA_PATH.write_text(expected, encoding="utf-8")
++    print(f"Wrote {SCHEMA_PATH}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/geo_evidence_mcp/provenance.py b/src/geo_evidence_mcp/provenance.py
+new file mode 100644
+index 0000000..3f6cacf
+--- /dev/null
++++ b/src/geo_evidence_mcp/provenance.py
+@@ -0,0 +1,168 @@
++"""The provenance block (R4): everything needed to audit, and replay, one tool call.
++
++Pydantic is the source of truth; docs/provenance-schema-1.0.json is generated from it
++(`uv run gem-export-schema`) and a test fails if the two drift apart.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import uuid
++from datetime import UTC, datetime
++from typing import Any, Literal
++
++from pydantic import BaseModel, ConfigDict, Field
++
++from geo_evidence_mcp import __version__
++from geo_evidence_mcp.models import BBox
++
++SCHEMA_VERSION = "1.0"
++SHORT_ID_LENGTH = 8
++
++Unit = Literal["index", "reflectance", "class", "fraction", "count", "percent", "m"]
++Operation = Literal["stac_search", "load_window", "ndvi", "ndwi"]
++
++
++class _Strict(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++
++class ToolInfo(_Strict):
++    name: str
++    version: str
++
++
++class Request(_Strict):
++    """The tool call exactly as made: enough to run it again."""
++
++    tool: str
++    args: dict[str, Any]
++
++
++class Source(_Strict):
++    """One asset a number was computed from."""
++
++    stac_api: str
++    collection: str
++    item_id: str
++    item_href: str | None = None
++    asset_key: str
++    band: str | None = None
++    href: str
++    datetime: datetime
++    processing_level: str | None = None  # e.g. L2A
++    processing_baseline: str | None = None
++    cloud_cover_pct: float | None = None
++    scale: float
++    offset: float
++    nodata: float | None = None
++
++
++class Spatial(_Strict):
++    crs: str  # CRS of `bbox` and of the pixel grid
++    bbox: tuple[float, float, float, float]  # west, south, east, north in `crs`
++    aoi_geometry: dict[str, Any]  # GeoJSON, EPSG:4326: the area the caller asked for
++    resolution: float | None = None  # pixel size in CRS units
++    height: int | None = None
++    width: int | None = None
++    clipped: bool = False
++
++
++class Computation(_Strict):
++    operation: Operation
++    formula: str | None = None
++    parameters: dict[str, Any] = Field(default_factory=dict)
++    resampling: Literal["none"] = "none"  # all reads are on the native grid
++    nodata_policy: str
++
++
++class Output(_Strict):
++    """One number the call produced. Claims in an answer are checked against these."""
++
++    name: str
++    value: float
++    unit: Unit
++    subject: str | None = None  # e.g. the item id when a search returns one value per scene
++
++
++class ToolTrace(_Strict):
++    trace_id: str
++    span_id: str
++    run_id: str | None = None  # agent run, when the caller supplies one
++    started_at: datetime
++    duration_ms: float = Field(ge=0)
++
++
++class ProvenanceBlock(_Strict):
++    schema_version: Literal["1.0"] = "1.0"
++    block_id: uuid.UUID
++    generated_at: datetime
++    tool: ToolInfo
++    request: Request
++    args_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
++    sources: list[Source]
++    spatial: Spatial
++    computation: Computation
++    outputs: list[Output] = Field(min_length=1)
++    tool_trace: ToolTrace
++
++    @property
++    def short_id(self) -> str:
++        """Compact id an answer can cite, e.g. [3f9a1c2e]."""
++        return self.block_id.hex[:SHORT_ID_LENGTH]
++
++
++def _canonical(value: Any) -> Any:
++    if isinstance(value, float):
++        return round(value, 6)
++    if isinstance(value, dict):
++        return {str(k): _canonical(v) for k, v in value.items()}
++    if isinstance(value, list | tuple):
++        return [_canonical(v) for v in value]
++    return value
++
++
++def compute_args_hash(tool: str, args: dict[str, Any]) -> str:
++    """SHA-256 of the canonical JSON of the call: key order and float noise do not matter."""
++    payload = json.dumps(
++        _canonical({"tool": tool, "args": args}), sort_keys=True, separators=(",", ":")
++    )
++    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
++
++
++def bbox_polygon(bbox: BBox) -> dict[str, Any]:
++    w, s, e, n = bbox.as_tuple
++    return {"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}
++
++
++def build_block(
++    *,
++    tool: str,
++    args: dict[str, Any],
++    sources: list[Source],
++    spatial: Spatial,
++    computation: Computation,
++    outputs: list[Output],
++    started_at: datetime,
++    duration_ms: float,
++    run_id: str | None = None,
++) -> ProvenanceBlock:
++    return ProvenanceBlock(
++        block_id=uuid.uuid4(),
++        generated_at=datetime.now(UTC),
++        tool=ToolInfo(name=tool, version=__version__),
++        request=Request(tool=tool, args=args),
++        args_hash=compute_args_hash(tool, args),
++        sources=sources,
++        spatial=spatial,
++        computation=computation,
++        outputs=outputs,
++        tool_trace=ToolTrace(
++            trace_id=uuid.uuid4().hex,
++            span_id=uuid.uuid4().hex[:16],
++            run_id=run_id,
++            started_at=started_at,
++            duration_ms=duration_ms,
++        ),
++    )
+diff --git a/src/geo_evidence_mcp/replay.py b/src/geo_evidence_mcp/replay.py
+new file mode 100644
+index 0000000..8f1e1e8
+--- /dev/null
++++ b/src/geo_evidence_mcp/replay.py
+@@ -0,0 +1,43 @@
++"""Replay a stored provenance block (R5): run the recorded call again and diff the numbers."""
++
++from __future__ import annotations
++
++import math
++
++from geo_evidence_mcp import service
++from geo_evidence_mcp.provenance import Output, ProvenanceBlock
++from geo_evidence_mcp.results import ReplayMismatch, ReplayReport
++from geo_evidence_mcp.stac import StacClientLike
++
++REL_TOL = 1e-6
++ABS_TOL = 1e-9
++
++
++def _keyed(outputs: list[Output]) -> dict[tuple[str | None, str], float]:
++    return {(o.subject, o.name): o.value for o in outputs}
++
++
++def replay_block(block: ProvenanceBlock, *, client: StacClientLike | None = None) -> ReplayReport:
++    """Re-execute `block.request` (nothing is persisted) and compare every recorded output.
++
++    A mismatch means the data or the code changed since the original call. Note that a replayed
++    `search_stac` legitimately differs once newer scenes exist.
++    """
++    fresh = service.execute(block.request.tool, block.request.args, client=client)
++    old, new = _keyed(block.outputs), _keyed(fresh.provenance.outputs)
++    mismatches = [
++        ReplayMismatch(name=name, subject=subject, stored=old[key], replayed=new[key])
++        for key in old.keys() & new.keys()
++        for subject, name in [key]
++        if not math.isclose(old[key], new[key], rel_tol=REL_TOL, abs_tol=ABS_TOL)
++    ]
++    mismatches.sort(key=lambda m: (m.name, m.subject or ""))
++    missing = sorted(f"{s or ''}{'/' if s else ''}{n}" for s, n in old.keys() - new.keys())
++    extra = sorted(f"{s or ''}{'/' if s else ''}{n}" for s, n in new.keys() - old.keys())
++    return ReplayReport(
++        matches=not (mismatches or missing or extra),
++        compared=len(old.keys() & new.keys()),
++        mismatches=mismatches,
++        missing_in_replay=missing,
++        extra_in_replay=extra,
++    )
+diff --git a/src/geo_evidence_mcp/results.py b/src/geo_evidence_mcp/results.py
+index 4c39a25..b3a5b88 100644
+--- a/src/geo_evidence_mcp/results.py
++++ b/src/geo_evidence_mcp/results.py
+@@ -1,4 +1,4 @@
+-"""Typed tool results. `sources` mirrors the draft provenance schema (full block in M3)."""
++"""Typed tool results. Every numeric result carries its provenance block (R4)."""
+ 
+ from __future__ import annotations
+ 
+@@ -7,25 +7,10 @@ from typing import Literal
+ 
+ from pydantic import BaseModel
+ 
++from geo_evidence_mcp.provenance import ProvenanceBlock
+ from geo_evidence_mcp.zonal import ZonalStats
+ 
+ 
+-class SourceRef(BaseModel):
+-    """One asset a number was computed from."""
+-
+-    item_id: str
+-    collection: str
+-    asset_key: str
+-    band: str | None
+-    href: str
+-    datetime: datetime
+-    processing_baseline: str | None
+-    cloud_cover: float | None
+-    scale: float
+-    offset: float
+-    nodata: float | None
+-
+-
+ class GridInfo(BaseModel):
+     crs: str
+     bounds: tuple[float, float, float, float]  # west, south, east, north in `crs`
+@@ -49,12 +34,13 @@ class SearchResult(BaseModel):
+     count: int
+     max_cloud: float
+     scenes: list[SceneBrief]  # least cloudy first
++    provenance: ProvenanceBlock
+ 
+ 
+ class WindowResult(BaseModel):
+-    sources: list[SourceRef]
+     grid: GridInfo
+     stats: ZonalStats  # of the physical values (reflectance for optical bands)
++    provenance: ProvenanceBlock
+ 
+ 
+ class IndexResult(BaseModel):
+@@ -62,7 +48,27 @@ class IndexResult(BaseModel):
+     formula: str
+     clip_min: float  # reflectance is clipped to this value before the ratio
+     zone: Literal["bbox", "polygon"]
+-    sources: list[SourceRef]
+     grid: GridInfo
+     negative_reflectance_fraction: float  # share of in-zone pixels clipped (either band < 0)
+     stats: ZonalStats
++    provenance: ProvenanceBlock
++
++
++class ReplayMismatch(BaseModel):
++    name: str
++    subject: str | None
++    stored: float
++    replayed: float
++
++
++class ReplayReport(BaseModel):
++    matches: bool
++    compared: int
++    mismatches: list[ReplayMismatch]
++    missing_in_replay: list[str]
++    extra_in_replay: list[str]
++
++
++class ProvenanceLookup(BaseModel):
++    block: ProvenanceBlock
++    replay: ReplayReport | None = None
+diff --git a/src/geo_evidence_mcp/server.py b/src/geo_evidence_mcp/server.py
+index 8583d8c..20d9c47 100644
+--- a/src/geo_evidence_mcp/server.py
++++ b/src/geo_evidence_mcp/server.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ from collections.abc import Callable
+ from datetime import date
+ from typing import Annotated, Any, Literal
++from uuid import UUID
+ 
+ from fastmcp import FastMCP
+ from fastmcp.exceptions import ToolError
+@@ -14,8 +15,15 @@ from pystac_client.exceptions import APIError
+ from geo_evidence_mcp import __version__, service
+ from geo_evidence_mcp.config import get_settings
+ from geo_evidence_mcp.models import BBox
+-from geo_evidence_mcp.results import IndexResult, SearchResult, WindowResult
++from geo_evidence_mcp.replay import replay_block
++from geo_evidence_mcp.results import (
++    IndexResult,
++    ProvenanceLookup,
++    SearchResult,
++    WindowResult,
++)
+ from geo_evidence_mcp.stac import StacClientLike
++from geo_evidence_mcp.store import ProvenanceStore, make_store
+ 
+ BBoxArg = Annotated[
+     list[float],
+@@ -23,14 +31,18 @@ BBoxArg = Annotated[
+ ]
+ IndexArg = Annotated[Literal["ndvi", "ndwi"], Field(description="Spectral index to compute")]
+ ItemIdArg = Annotated[str, Field(description="STAC item id, e.g. from search_stac")]
++RunIdArg = Annotated[
++    str | None, Field(description="Optional agent run id, stored in the trace to correlate calls")
++]
+ GeometryArg = Annotated[
+     dict[str, Any], Field(description="GeoJSON Polygon or MultiPolygon geometry in EPSG:4326")
+ ]
+ 
+ INSTRUCTIONS = (
+-    "Earth-observation tools over Sentinel-2 L2A. Every numeric result lists the exact scene, "
+-    "bands, scale/offset and pixel grid it was computed from. Quote numbers only as returned; "
+-    "if a tool refuses or returns no data, say so instead of estimating."
++    "Earth-observation tools over Sentinel-2 L2A. Every numeric result carries a provenance "
++    "block (scene, bands, CRS, parameters, trace) and is stored under its block_id. Quote "
++    "numbers only as returned and cite the block; if a tool refuses or returns no data, say so "
++    "instead of estimating."
+ )
+ 
+ 
+@@ -46,9 +58,12 @@ def _bbox(values: list[float]) -> BBox:
+     return BBox(west=values[0], south=values[1], east=values[2], north=values[3])
+ 
+ 
+-def build_server(client: StacClientLike | None = None) -> FastMCP:
+-    """Create the server. `client` lets tests inject a fake STAC API."""
++def build_server(
++    client: StacClientLike | None = None, store: ProvenanceStore | None = None
++) -> FastMCP:
++    """Create the server. `client` and `store` let tests inject a fake STAC API and storage."""
+     mcp = FastMCP("geo-evidence-mcp", instructions=INSTRUCTIONS)
++    blocks = store if store is not None else make_store(get_settings())
+ 
+     @mcp.tool
+     def health() -> dict[str, str]:
+@@ -67,6 +82,7 @@ def build_server(client: StacClientLike | None = None) -> FastMCP:
+         max_cloud: Annotated[float, Field(ge=0, le=100, description="Max cloud cover, %")] = 20.0,
+         limit: Annotated[int, Field(ge=1, le=100)] = 20,
+         collection: str = service.DEFAULT_COLLECTION,
++        run_id: RunIdArg = None,
+     ) -> SearchResult:
+         """Find Sentinel-2 scenes over an area and period, least cloudy first."""
+         return _guard(
+@@ -78,6 +94,8 @@ def build_server(client: StacClientLike | None = None) -> FastMCP:
+                 limit=limit,
+                 collection=collection,
+                 client=client,
++                store=blocks,
++                run_id=run_id,
+             )
+         )
+ 
+@@ -87,6 +105,7 @@ def build_server(client: StacClientLike | None = None) -> FastMCP:
+         asset_key: Annotated[str, Field(description="Asset key such as red, nir, green, scl")],
+         bbox: BBoxArg,
+         collection: str = service.DEFAULT_COLLECTION,
++        run_id: RunIdArg = None,
+     ) -> WindowResult:
+         """Read one band over an area; returns grid info and summary statistics, not pixels."""
+         return _guard(
+@@ -101,11 +120,18 @@ def build_server(client: StacClientLike | None = None) -> FastMCP:
+         index: IndexArg,
+         bbox: BBoxArg,
+         collection: str = service.DEFAULT_COLLECTION,
++        run_id: RunIdArg = None,
+     ) -> IndexResult:
+         """Compute NDVI or NDWI for a scene over a bounding box, with summary statistics."""
+         return _guard(
+             lambda: service.index_stats(
+-                item_id, index, bbox=_bbox(bbox), collection=collection, client=client
++                item_id,
++                index,
++                bbox=_bbox(bbox),
++                collection=collection,
++                client=client,
++                store=blocks,
++                run_id=run_id,
+             )
+         )
+ 
+@@ -115,14 +141,39 @@ def build_server(client: StacClientLike | None = None) -> FastMCP:
+         index: IndexArg,
+         geometry: GeometryArg,
+         collection: str = service.DEFAULT_COLLECTION,
++        run_id: RunIdArg = None,
+     ) -> IndexResult:
+         """Compute NDVI or NDWI statistics inside a polygon (pixel centres inside the polygon)."""
+         return _guard(
+             lambda: service.index_stats(
+-                item_id, index, geometry=geometry, collection=collection, client=client
++                item_id,
++                index,
++                geometry=geometry,
++                collection=collection,
++                client=client,
++                store=blocks,
++                run_id=run_id,
+             )
+         )
+ 
++    @mcp.tool
++    def get_provenance(
++        block_id: Annotated[str, Field(description="Full block_id (UUID) from a tool result")],
++        replay: Annotated[
++            bool, Field(description="Re-run the recorded call and compare every number")
++        ] = False,
++    ) -> ProvenanceLookup:
++        """Fetch a stored provenance block; optionally replay it to verify the numbers."""
++
++        def lookup() -> ProvenanceLookup:
++            block = blocks.get(UUID(block_id))
++            if block is None:
++                raise LookupError(f"no provenance block {block_id!r}")
++            report = replay_block(block, client=client) if replay else None
++            return ProvenanceLookup(block=block, replay=report)
++
++        return _guard(lookup)
++
+     return mcp
+ 
+ 
+diff --git a/src/geo_evidence_mcp/service.py b/src/geo_evidence_mcp/service.py
+index 1031dde..6280f6d 100644
+--- a/src/geo_evidence_mcp/service.py
++++ b/src/geo_evidence_mcp/service.py
+@@ -1,22 +1,33 @@
+-"""Tool logic as plain functions (R1). The MCP layer in server.py only wraps these."""
++"""Tool logic as plain functions (R1, R4). The MCP layer in server.py only wraps these."""
+ 
+ from __future__ import annotations
+ 
+-from datetime import date
++import time
++from datetime import UTC, date, datetime
+ from typing import Any, Literal
+ 
+ import numpy as np
+ from shapely.geometry import shape
+ 
++from geo_evidence_mcp.config import get_settings
+ from geo_evidence_mcp.indices import normalized_difference
+ from geo_evidence_mcp.models import BBox, SceneSummary
++from geo_evidence_mcp.provenance import (
++    Computation,
++    Output,
++    ProvenanceBlock,
++    Source,
++    Spatial,
++    Unit,
++    bbox_polygon,
++    build_block,
++)
+ from geo_evidence_mcp.raster import WindowData, load_window
+ from geo_evidence_mcp.results import (
+     GridInfo,
+     IndexResult,
+     SceneBrief,
+     SearchResult,
+-    SourceRef,
+     WindowResult,
+ )
+ from geo_evidence_mcp.stac import (
+@@ -25,31 +36,37 @@ from geo_evidence_mcp.stac import (
+     fetch_scene,
+ )
+ from geo_evidence_mcp.stac import search_stac as _search_stac
++from geo_evidence_mcp.store import ProvenanceStore
+ from geo_evidence_mcp.zonal import ZonalStats, zonal_stats, zone_mask
+ 
+ DEFAULT_COLLECTION = "sentinel-2-l2a"
+ MAX_WINDOW_PIXELS = 4_000_000  # about 20 x 20 km at 10 m; larger requests are refused
+ 
+ CLIP_MIN = 0.0
++NODATA_POLICY = "pixels equal to the asset nodata value are masked and excluded from statistics"
+ # index -> (formula, first asset, second asset): (first - second) / (first + second)
+ INDICES: dict[str, tuple[str, str, str]] = {
+     "ndvi": ("(nir - red) / (nir + red)", "nir", "red"),
+     "ndwi": ("(green - nir) / (green + nir)", "green", "nir"),
+ }
+ _ASSET_TO_BAND = {asset: band for band, asset in S2_BAND_TO_ASSET.items()}
++_PROCESSING_LEVEL = {"sentinel-2-l2a": "L2A", "sentinel-2-l1c": "L1C"}
+ 
+ 
+-def _source(scene: SceneSummary, asset_key: str) -> SourceRef:
++def _source(scene: SceneSummary, asset_key: str) -> Source:
+     ref = scene.assets[asset_key]
+-    return SourceRef(
+-        item_id=scene.item_id,
++    return Source(
++        stac_api=get_settings().stac_endpoint,
+         collection=scene.collection,
++        item_id=scene.item_id,
++        item_href=scene.self_href,
+         asset_key=asset_key,
+         band=_ASSET_TO_BAND.get(asset_key),
+         href=ref.href,
+         datetime=scene.datetime,
++        processing_level=_PROCESSING_LEVEL.get(scene.collection),
+         processing_baseline=scene.processing_baseline,
+-        cloud_cover=scene.cloud_cover,
++        cloud_cover_pct=scene.cloud_cover,
+         scale=ref.scale,
+         offset=ref.offset,
+         nodata=ref.nodata,
+@@ -68,6 +85,46 @@ def _grid(window: WindowData) -> GridInfo:
+     )
+ 
+ 
++def _spatial(grid: GridInfo, aoi_geometry: dict[str, Any]) -> Spatial:
++    return Spatial(
++        crs=grid.crs,
++        bbox=grid.bounds,
++        aoi_geometry=aoi_geometry,
++        resolution=grid.resolution,
++        height=grid.height,
++        width=grid.width,
++        clipped=grid.clipped,
++    )
++
++
++def _stat_outputs(prefix: str, stats: ZonalStats, unit: Unit) -> list[Output]:
++    outputs = [
++        Output(name=f"{prefix}.{key}", value=value, unit=unit)
++        for key in ("mean", "median", "std", "min", "max")
++        if (value := getattr(stats, key)) is not None
++    ]
++    outputs += [
++        Output(name="zone.valid_fraction", value=stats.valid_fraction, unit="fraction"),
++        Output(name="zone.valid_pixels", value=stats.valid_pixels, unit="count"),
++        Output(name="zone.total_pixels", value=stats.total_pixels, unit="count"),
++    ]
++    return outputs
++
++
++def _grid_outputs(grid: GridInfo) -> list[Output]:
++    return [
++        Output(name="grid.resolution", value=grid.resolution, unit="m"),
++        Output(name="grid.width", value=grid.width, unit="count"),
++        Output(name="grid.height", value=grid.height, unit="count"),
++    ]
++
++
++def _finish(block: ProvenanceBlock, store: ProvenanceStore | None) -> ProvenanceBlock:
++    if store is not None:
++        store.save(block)
++    return block
++
++
+ def search(
+     bbox: BBox,
+     start: date,
+@@ -77,10 +134,50 @@ def search(
+     limit: int = 20,
+     collection: str = DEFAULT_COLLECTION,
+     client: StacClientLike | None = None,
++    store: ProvenanceStore | None = None,
++    run_id: str | None = None,
+ ) -> SearchResult:
++    started, t0 = datetime.now(UTC), time.perf_counter()
+     scenes = _search_stac(
+         bbox, start, end, collection=collection, max_cloud=max_cloud, limit=limit, client=client
+     )
++    args: dict[str, Any] = {
++        "bbox": list(bbox.as_tuple),
++        "start": start.isoformat(),
++        "end": end.isoformat(),
++        "max_cloud": max_cloud,
++        "limit": limit,
++        "collection": collection,
++    }
++    outputs = [Output(name="search.count", value=len(scenes), unit="count")]
++    outputs += [
++        Output(name="cloud_cover", value=s.cloud_cover, unit="percent", subject=s.item_id)
++        for s in scenes
++        if s.cloud_cover is not None
++    ]
++    block = build_block(
++        tool="search_stac",
++        args=args,
++        sources=[],
++        spatial=Spatial(crs="EPSG:4326", bbox=bbox.as_tuple, aoi_geometry=bbox_polygon(bbox)),
++        computation=Computation(
++            operation="stac_search",
++            parameters={
++                "stac_api": get_settings().stac_endpoint,
++                "collection": collection,
++                "start": start.isoformat(),
++                "end": end.isoformat(),
++                "max_cloud": max_cloud,
++                "limit": limit,
++                "result_item_ids": [s.item_id for s in scenes],
++            },
++            nodata_policy="not applicable",
++        ),
++        outputs=outputs,
++        started_at=started,
++        duration_ms=(time.perf_counter() - t0) * 1000,
++        run_id=run_id,
++    )
+     return SearchResult(
+         count=len(scenes),
+         max_cloud=max_cloud,
+@@ -96,6 +193,7 @@ def search(
+             )
+             for s in scenes
+         ],
++        provenance=_finish(block, store),
+     )
+ 
+ 
+@@ -106,14 +204,41 @@ def window(
+     *,
+     collection: str = DEFAULT_COLLECTION,
+     client: StacClientLike | None = None,
++    store: ProvenanceStore | None = None,
++    run_id: str | None = None,
+ ) -> WindowResult:
++    started, t0 = datetime.now(UTC), time.perf_counter()
+     scene = fetch_scene(item_id, collection=collection, client=client)
+     data = load_window(scene, asset_key, bbox, max_pixels=MAX_WINDOW_PIXELS)
+-    return WindowResult(
++    stats = zonal_stats(data.values, data.transform, data.crs)
++    grid = _grid(data)
++    unit: Unit = "class" if asset_key == "scl" else "reflectance"
++    outputs = _stat_outputs(asset_key, stats, unit) + _grid_outputs(grid)
++    if scene.cloud_cover is not None:
++        outputs.append(
++            Output(name="cloud_cover", value=scene.cloud_cover, unit="percent", subject=item_id)
++        )
++    block = build_block(
++        tool="load_window",
++        args={
++            "item_id": item_id,
++            "asset_key": asset_key,
++            "bbox": list(bbox.as_tuple),
++            "collection": collection,
++        },
+         sources=[_source(scene, asset_key)],
+-        grid=_grid(data),
+-        stats=zonal_stats(data.values, data.transform, data.crs),
++        spatial=_spatial(grid, bbox_polygon(bbox)),
++        computation=Computation(
++            operation="load_window",
++            parameters={"statistics": "mean, median, std (population), min, max over valid pixels"},
++            nodata_policy=NODATA_POLICY,
++        ),
++        outputs=outputs,
++        started_at=started,
++        duration_ms=(time.perf_counter() - t0) * 1000,
++        run_id=run_id,
+     )
++    return WindowResult(grid=grid, stats=stats, provenance=_finish(block, store))
+ 
+ 
+ def _geometry_bbox(geometry: dict[str, Any]) -> BBox:
+@@ -134,12 +259,15 @@ def index_stats(
+     geometry: dict[str, Any] | None = None,
+     collection: str = DEFAULT_COLLECTION,
+     client: StacClientLike | None = None,
++    store: ProvenanceStore | None = None,
++    run_id: str | None = None,
+ ) -> IndexResult:
+     """Spectral-index statistics for a scene over a bbox, or inside a polygon (EPSG:4326)."""
+     if (bbox is None) == (geometry is None):
+         raise ValueError("provide exactly one of bbox or geometry")
+     if index not in INDICES:
+         raise ValueError(f"unknown index {index!r}; choose from {sorted(INDICES)}")
++    started, t0 = datetime.now(UTC), time.perf_counter()
+     formula, first_key, second_key = INDICES[index]
+     aoi = bbox if bbox is not None else _geometry_bbox(geometry or {})
+ 
+@@ -153,14 +281,97 @@ def index_stats(
+     inside = zone_mask(values.shape, first.transform, first.crs, geometry)
+     counted = inside & ~np.ma.getmaskarray(values)
+     negative = (np.ma.getdata(first.values) < 0) | (np.ma.getdata(second.values) < 0)
+-    stats: ZonalStats = zonal_stats(values, first.transform, first.crs, geometry)
++    stats = zonal_stats(values, first.transform, first.crs, geometry)
++    negative_fraction = float(negative[counted].mean()) if counted.any() else 0.0
++    grid = _grid(first)
++    zone: Literal["bbox", "polygon"] = "polygon" if geometry is not None else "bbox"
++
++    args: dict[str, Any] = {"item_id": item_id, "index": index, "collection": collection}
++    args.update({"geometry": geometry} if geometry is not None else {"bbox": list(aoi.as_tuple)})
++    outputs = _stat_outputs(index, stats, "index")
++    outputs.append(
++        Output(name="negative_reflectance_fraction", value=negative_fraction, unit="fraction")
++    )
++    outputs += _grid_outputs(grid)
++    if scene.cloud_cover is not None:
++        outputs.append(
++            Output(name="cloud_cover", value=scene.cloud_cover, unit="percent", subject=item_id)
++        )
++    block = build_block(
++        tool="zonal_stats" if geometry is not None else "band_math",
++        args=args,
++        sources=[_source(scene, first_key), _source(scene, second_key)],
++        spatial=_spatial(grid, geometry if geometry is not None else bbox_polygon(aoi)),
++        computation=Computation(
++            operation=index,
++            formula=formula,
++            parameters={
++                "clip_min": CLIP_MIN,
++                "zone": zone,
++                "pixel_inclusion": "pixel centre inside the zone",
++                "max_window_pixels": MAX_WINDOW_PIXELS,
++            },
++            nodata_policy=NODATA_POLICY,
++        ),
++        outputs=outputs,
++        started_at=started,
++        duration_ms=(time.perf_counter() - t0) * 1000,
++        run_id=run_id,
++    )
+     return IndexResult(
+         index=index,
+         formula=formula,
+         clip_min=CLIP_MIN,
+-        zone="polygon" if geometry is not None else "bbox",
+-        sources=[_source(scene, first_key), _source(scene, second_key)],
+-        grid=_grid(first),
+-        negative_reflectance_fraction=float(negative[counted].mean()) if counted.any() else 0.0,
++        zone=zone,
++        grid=grid,
++        negative_reflectance_fraction=negative_fraction,
+         stats=stats,
++        provenance=_finish(block, store),
+     )
++
++
++def execute(
++    tool: str,
++    args: dict[str, Any],
++    *,
++    client: StacClientLike | None = None,
++    store: ProvenanceStore | None = None,
++    run_id: str | None = None,
++) -> SearchResult | WindowResult | IndexResult:
++    """Run a tool from its recorded request: the basis of replay (R5)."""
++    collection = args.get("collection", DEFAULT_COLLECTION)
++    common: dict[str, Any] = {"client": client, "store": store, "run_id": run_id}
++    if tool == "search_stac":
++        west, south, east, north = args["bbox"]
++        return search(
++            BBox(west=west, south=south, east=east, north=north),
++            date.fromisoformat(args["start"]),
++            date.fromisoformat(args["end"]),
++            max_cloud=args["max_cloud"],
++            limit=args["limit"],
++            collection=collection,
++            **common,
++        )
++    if tool == "load_window":
++        west, south, east, north = args["bbox"]
++        return window(
++            args["item_id"],
++            args["asset_key"],
++            BBox(west=west, south=south, east=east, north=north),
++            collection=collection,
++            **common,
++        )
++    if tool in ("band_math", "zonal_stats"):
++        box = None
++        if "bbox" in args:
++            west, south, east, north = args["bbox"]
++            box = BBox(west=west, south=south, east=east, north=north)
++        return index_stats(
++            args["item_id"],
++            args["index"],
++            bbox=box,
++            geometry=args.get("geometry"),
++            collection=collection,
++            **common,
++        )
++    raise ValueError(f"cannot replay unknown tool {tool!r}")
+diff --git a/src/geo_evidence_mcp/sql/001_provenance.sql b/src/geo_evidence_mcp/sql/001_provenance.sql
+new file mode 100644
+index 0000000..bff11e3
+--- /dev/null
++++ b/src/geo_evidence_mcp/sql/001_provenance.sql
+@@ -0,0 +1,17 @@
++-- Provenance blocks (R4, R5). One row per tool call that produced numbers.
++CREATE EXTENSION IF NOT EXISTS postgis;
++
++CREATE TABLE IF NOT EXISTS provenance_blocks (
++    block_id    uuid PRIMARY KEY,
++    trace_id    text        NOT NULL,
++    run_id      text,
++    tool        text        NOT NULL,
++    args_hash   text        NOT NULL,
++    created_at  timestamptz NOT NULL,
++    aoi         geometry(Geometry, 4326) NOT NULL,
++    block       jsonb       NOT NULL
++);
++
++CREATE INDEX IF NOT EXISTS provenance_blocks_trace_idx ON provenance_blocks (trace_id);
++CREATE INDEX IF NOT EXISTS provenance_blocks_args_idx  ON provenance_blocks (args_hash);
++CREATE INDEX IF NOT EXISTS provenance_blocks_aoi_gix   ON provenance_blocks USING GIST (aoi);
+diff --git a/src/geo_evidence_mcp/store.py b/src/geo_evidence_mcp/store.py
+new file mode 100644
+index 0000000..bccc386
+--- /dev/null
++++ b/src/geo_evidence_mcp/store.py
+@@ -0,0 +1,93 @@
++"""Provenance storage (R5): in memory for tests, PostgreSQL/PostGIS for real runs."""
++
++from __future__ import annotations
++
++import json
++from importlib import resources
++from typing import Protocol
++from uuid import UUID
++
++import psycopg
++from psycopg.types.json import Jsonb
++
++from geo_evidence_mcp.config import Settings
++from geo_evidence_mcp.provenance import ProvenanceBlock
++
++
++class ProvenanceStore(Protocol):
++    def save(self, block: ProvenanceBlock) -> None: ...
++    def get(self, block_id: UUID) -> ProvenanceBlock | None: ...
++    def by_trace(self, trace_id: str) -> list[ProvenanceBlock]: ...
++
++
++class MemoryStore:
++    def __init__(self) -> None:
++        self._blocks: dict[UUID, ProvenanceBlock] = {}
++
++    def save(self, block: ProvenanceBlock) -> None:
++        self._blocks[block.block_id] = block
++
++    def get(self, block_id: UUID) -> ProvenanceBlock | None:
++        return self._blocks.get(block_id)
++
++    def by_trace(self, trace_id: str) -> list[ProvenanceBlock]:
++        return [b for b in self._blocks.values() if b.tool_trace.trace_id == trace_id]
++
++
++class PostgresStore:
++    """One connection per call: simple and safe; a pool can replace it if latency matters."""
++
++    def __init__(self, dsn: str) -> None:
++        self._dsn = dsn
++
++    def ensure_schema(self) -> None:
++        sql = (resources.files("geo_evidence_mcp") / "sql" / "001_provenance.sql").read_text(
++            encoding="utf-8"
++        )
++        with psycopg.connect(self._dsn) as conn:
++            conn.execute(sql)
++
++    def save(self, block: ProvenanceBlock) -> None:
++        with psycopg.connect(self._dsn) as conn:
++            conn.execute(
++                """
++                INSERT INTO provenance_blocks
++                    (block_id, trace_id, run_id, tool, args_hash, created_at, aoi, block)
++                VALUES (%s, %s, %s, %s, %s, %s,
++                        ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s)
++                ON CONFLICT (block_id) DO NOTHING
++                """,
++                (
++                    block.block_id,
++                    block.tool_trace.trace_id,
++                    block.tool_trace.run_id,
++                    block.tool.name,
++                    block.args_hash,
++                    block.generated_at,
++                    json.dumps(block.spatial.aoi_geometry),
++                    Jsonb(block.model_dump(mode="json")),
++                ),
++            )
++
++    def get(self, block_id: UUID) -> ProvenanceBlock | None:
++        with psycopg.connect(self._dsn) as conn:
++            row = conn.execute(
++                "SELECT block FROM provenance_blocks WHERE block_id = %s", (block_id,)
++            ).fetchone()
++        return ProvenanceBlock.model_validate(row[0]) if row else None
++
++    def by_trace(self, trace_id: str) -> list[ProvenanceBlock]:
++        with psycopg.connect(self._dsn) as conn:
++            rows = conn.execute(
++                "SELECT block FROM provenance_blocks WHERE trace_id = %s ORDER BY created_at",
++                (trace_id,),
++            ).fetchall()
++        return [ProvenanceBlock.model_validate(r[0]) for r in rows]
++
++
++def make_store(settings: Settings) -> ProvenanceStore:
++    if settings.store_backend == "postgres":
++        store = PostgresStore(settings.database_url)
++        store.ensure_schema()
++        return store
++    return MemoryStore()
+diff --git a/src/geo_evidence_mcp/validator.py b/src/geo_evidence_mcp/validator.py
+new file mode 100644
+index 0000000..2f20b8c
+--- /dev/null
++++ b/src/geo_evidence_mcp/validator.py
+@@ -0,0 +1,168 @@
++"""Post-hoc claim validator (R6): every number in an answer must trace to a tool output.
++
++Heuristic by design. It cannot judge whether a sentence is *true*, only whether each number it
++states was actually produced by a recorded tool call (as a value, or as a difference between two
++values of the same quantity). Numbers that are clearly not claims (dates, item ids, EPSG codes,
++band names, years) are skipped. See docs/adr/ADR-004 for the limits.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Iterable
++from dataclasses import dataclass
++from itertools import combinations
++from typing import Literal
++
++from pydantic import BaseModel
++
++from geo_evidence_mcp.provenance import ProvenanceBlock, Unit
++
++_CLEANERS = [
++    re.compile(r"https?://\S+"),
++    re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
++    re.compile(r"\bsha256:[0-9a-f]+"),
++    re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+Z?)?"),
++    re.compile(r"\b[A-Z][A-Z0-9]+(?:_[A-Za-z0-9]+){2,}\b"),  # STAC item ids
++    re.compile(r"\bEPSG:\d+"),
++    re.compile(r"\bB(?:0?[1-9]|1[0-2])A?\b"),  # Sentinel-2 band names
++    re.compile(r"\bL[12][AC]\b"),
++    re.compile(r"\bSentinel-?[12]\b", re.IGNORECASE),
++    re.compile(r"\bbaseline\s+\d{2}\.\d{2}\b", re.IGNORECASE),
++    re.compile(r"\[[0-9a-f]{8}\]"),  # short-id citations
++]
++_NUMBER = re.compile(
++    r"(?<![\w.])(?P<sign>[-+\u2212]?)"
++    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?)"
++    r"(?P<pct>\s?%)?"
++)
++_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
++
++
++class NumberMention(BaseModel):
++    text: str
++    value: float  # signed, as written (a percent stays in percent units)
++    decimals: int
++    percent: bool
++    start: int
++    end: int
++
++
++class ClaimCheck(BaseModel):
++    mention: NumberMention
++    status: Literal["supported", "unsupported", "ignored"]
++    matched: str | None = None
++    reason: str | None = None
++
++
++class ValidationReport(BaseModel):
++    ok: bool
++    checks: list[ClaimCheck]
++
++    @property
++    def unsupported(self) -> list[NumberMention]:
++        return [c.mention for c in self.checks if c.status == "unsupported"]
++
++
++@dataclass(frozen=True)
++class _Candidate:
++    value: float
++    unit: Unit
++    label: str
++    derived: bool
++
++
++def _blank_out(text: str) -> str:
++    for pattern in _CLEANERS:
++        text = pattern.sub(lambda m: " " * len(m.group(0)), text)
++    return text
++
++
++def extract_numbers(text: str) -> list[NumberMention]:
++    mentions: list[NumberMention] = []
++    for match in _NUMBER.finditer(_blank_out(text)):
++        raw = match.group("num")
++        cleaned = raw.replace(",", "") if _THOUSANDS.fullmatch(raw) else raw.replace(",", ".")
++        decimals = len(cleaned.split(".")[1]) if "." in cleaned else 0
++        value = float(cleaned)
++        if match.group("sign") in ("-", "\u2212"):
++            value = -value
++        mentions.append(
++            NumberMention(
++                text=match.group(0).strip(),
++                value=value,
++                decimals=decimals,
++                percent=match.group("pct") is not None,
++                start=match.start(),
++                end=match.end(),
++            )
++        )
++    return mentions
++
++
++def _candidates(blocks: Iterable[ProvenanceBlock]) -> list[_Candidate]:
++    base: list[tuple[str, str | None, str, float, Unit]] = []  # block, subject, name, value, unit
++    for block in blocks:
++        for out in block.outputs:
++            base.append((block.short_id, out.subject, out.name, out.value, out.unit))
++    candidates = [
++        _Candidate(v, u, f"{n}{f' ({s})' if s else ''} [{b}]", False) for b, s, n, v, u in base
++    ]
++    for (b1, s1, n1, v1, u1), (b2, s2, n2, v2, u2) in combinations(base, 2):
++        if n1 == n2 and u1 == u2 and (b1 != b2 or s1 != s2) and u1 not in ("class",):
++            candidates.append(
++                _Candidate(v1 - v2, u1, f"difference of {n1} between [{b1}] and [{b2}]", True)
++            )
++    return candidates
++
++
++def _supports(mention: NumberMention, candidate: _Candidate) -> bool:
++    tolerance = 0.5 * 10 ** (-mention.decimals) + 1e-9
++    if mention.percent:
++        if candidate.unit == "percent":
++            target = candidate.value
++        elif candidate.unit == "fraction":
++            target = candidate.value * 100
++        else:
++            return False
++    else:
++        target = candidate.value
++    if candidate.derived:
++        return bool(abs(abs(mention.value) - abs(target)) <= tolerance)
++    return bool(abs(mention.value - target) <= tolerance)
++
++
++def validate_claims(
++    text: str,
++    blocks: Iterable[ProvenanceBlock],
++    *,
++    ignore_integers_up_to: int = 0,
++) -> ValidationReport:
++    """Check every number in `text` against the outputs of `blocks`.
++
++    A number is supported when, rounded to the precision it is written with, it equals a recorded
++    output, or the difference between two recorded values of the same quantity. A percent sign
++    requires a fraction or percent quantity. Bare four-digit years and (optionally) small integers
++    are ignored rather than flagged.
++    """
++    candidates = _candidates(list(blocks))
++    checks: list[ClaimCheck] = []
++    for mention in extract_numbers(text):
++        match = next((c for c in candidates if _supports(mention, c)), None)
++        if match is not None:
++            checks.append(ClaimCheck(mention=mention, status="supported", matched=match.label))
++            continue
++        plain_int = mention.decimals == 0 and not mention.percent
++        if plain_int and 1900 <= abs(mention.value) <= 2100:
++            checks.append(ClaimCheck(mention=mention, status="ignored", reason="looks like a year"))
++        elif plain_int and abs(mention.value) <= ignore_integers_up_to:
++            checks.append(ClaimCheck(mention=mention, status="ignored", reason="small integer"))
++        else:
++            checks.append(
++                ClaimCheck(
++                    mention=mention,
++                    status="unsupported",
++                    reason="no tool output or difference of outputs equals this number",
++                )
++            )
++    return ValidationReport(ok=all(c.status != "unsupported" for c in checks), checks=checks)
+diff --git a/tests/helpers.py b/tests/helpers.py
+new file mode 100644
+index 0000000..ac375d1
+--- /dev/null
++++ b/tests/helpers.py
+@@ -0,0 +1,39 @@
++"""Small builders shared by provenance, validator and store tests."""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from typing import Any
++
++from geo_evidence_mcp.models import BBox
++from geo_evidence_mcp.provenance import (
++    Computation,
++    Output,
++    ProvenanceBlock,
++    Spatial,
++    Unit,
++    bbox_polygon,
++    build_block,
++)
++
++AOI = BBox(west=8.137, south=33.893, east=8.159, north=33.911)
++
++
++def make_block(
++    outputs: list[tuple[str, float, Unit]],
++    *,
++    tool: str = "band_math",
++    args: dict[str, Any] | None = None,
++    run_id: str | None = None,
++) -> ProvenanceBlock:
++    return build_block(
++        tool=tool,
++        args=args or {"item_id": "X", "index": "ndvi", "bbox": list(AOI.as_tuple)},
++        sources=[],
++        spatial=Spatial(crs="EPSG:4326", bbox=AOI.as_tuple, aoi_geometry=bbox_polygon(AOI)),
++        computation=Computation(operation="ndvi", nodata_policy="test"),
++        outputs=[Output(name=n, value=v, unit=u) for n, v, u in outputs],
++        started_at=datetime.now(UTC),
++        duration_ms=1.0,
++        run_id=run_id,
++    )
+diff --git a/tests/test_provenance.py b/tests/test_provenance.py
+new file mode 100644
+index 0000000..92669dd
+--- /dev/null
++++ b/tests/test_provenance.py
+@@ -0,0 +1,57 @@
++"""R4: the provenance block, its hash and its published JSON Schema."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++from pydantic import ValidationError
++
++from geo_evidence_mcp.export_schema import SCHEMA_PATH, render
++from geo_evidence_mcp.provenance import ProvenanceBlock, compute_args_hash
++from tests.helpers import make_block
++
++
++@pytest.mark.req("R4")
++def test_args_hash_ignores_key_order_and_float_noise() -> None:
++    a = compute_args_hash("band_math", {"bbox": [8.137, 33.893, 8.159, 33.911], "index": "ndvi"})
++    b = compute_args_hash(
++        "band_math", {"index": "ndvi", "bbox": [8.137, 33.893, 8.1590000001, 33.911]}
++    )
++    assert a == b and a.startswith("sha256:") and len(a) == 71
++
++
++@pytest.mark.req("R4")
++def test_args_hash_changes_with_tool_or_arguments() -> None:
++    base = compute_args_hash("band_math", {"index": "ndvi"})
++    assert compute_args_hash("band_math", {"index": "ndwi"}) != base
++    assert compute_args_hash("zonal_stats", {"index": "ndvi"}) != base
++
++
++@pytest.mark.req("R4")
++def test_block_requires_outputs_and_forbids_unknown_fields() -> None:
++    block = make_block([("ndvi.mean", 0.7, "index")])
++    data = block.model_dump(mode="json")
++    ProvenanceBlock.model_validate(data)  # round trip
++    with pytest.raises(ValidationError):
++        ProvenanceBlock.model_validate({**data, "outputs": []})
++    with pytest.raises(ValidationError):
++        ProvenanceBlock.model_validate({**data, "surprise": 1})
++    with pytest.raises(ValidationError):
++        ProvenanceBlock.model_validate({**data, "args_hash": "md5:abc"})
++
++
++@pytest.mark.req("R4")
++def test_short_id_is_the_first_eight_hex_digits_of_the_block_id() -> None:
++    block = make_block([("ndvi.mean", 0.7, "index")])
++    assert block.short_id == block.block_id.hex[:8] and len(block.short_id) == 8
++
++
++@pytest.mark.req("R16")
++def test_committed_json_schema_matches_the_model() -> None:
++    assert SCHEMA_PATH.exists(), "run `uv run gem-export-schema`"
++    assert SCHEMA_PATH.read_text(encoding="utf-8") == render()
++    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
++    assert {"block_id", "args_hash", "sources", "spatial", "outputs", "tool_trace"} <= set(
++        schema["required"] + list(schema["properties"])
++    )
+diff --git a/tests/test_server.py b/tests/test_server.py
+index fb7456d..3cc71f4 100644
+--- a/tests/test_server.py
++++ b/tests/test_server.py
+@@ -6,10 +6,12 @@ import asyncio
+ from typing import Any
+ 
+ import pytest
++import rasterio
+ from fastmcp import Client
+ from fastmcp.exceptions import ToolError
+ 
+ from geo_evidence_mcp.server import build_server
++from geo_evidence_mcp.store import MemoryStore, ProvenanceStore
+ from tests.conftest import FakeCatalog, Synthetic, scene_to_item
+ 
+ PALM_ZONE = {
+@@ -19,11 +21,26 @@ PALM_ZONE = {
+     ],
+ }
+ AOI = [8.137, 33.893, 8.159, 33.911]
+-EXPECTED_TOOLS = {"health", "search_stac", "load_window", "band_math", "zonal_stats"}
++EXPECTED_TOOLS = {
++    "health",
++    "search_stac",
++    "load_window",
++    "band_math",
++    "zonal_stats",
++    "get_provenance",
++}
+ 
+ 
+-def call(synthetic: Synthetic, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+-    server = build_server(client=FakeCatalog([scene_to_item(synthetic.scene)]))
++def call(
++    synthetic: Synthetic,
++    tool: str,
++    args: dict[str, Any],
++    store: ProvenanceStore | None = None,
++) -> dict[str, Any]:
++    server = build_server(
++        client=FakeCatalog([scene_to_item(synthetic.scene)]),
++        store=store if store is not None else MemoryStore(),
++    )
+ 
+     async def run() -> dict[str, Any]:
+         async with Client(server) as client:
+@@ -74,7 +91,7 @@ def test_load_window_reports_grid_and_masked_pixels(synthetic: Synthetic) -> Non
+     grid = out["grid"]
+     assert grid["crs"] == "EPSG:32632" and grid["resolution"] == 10.0 and not grid["clipped"]
+     assert out["stats"]["valid_pixels"] == out["stats"]["total_pixels"] - 25  # the nodata hole
+-    source = out["sources"][0]
++    source = out["provenance"]["sources"][0]
+     assert (source["band"], source["scale"], source["offset"]) == ("B04", 1e-4, -0.1)
+ 
+ 
+@@ -84,7 +101,7 @@ def test_band_math_ndvi_over_bbox_lists_both_sources(synthetic: Synthetic) -> No
+         synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
+     )
+     assert out["zone"] == "bbox" and out["formula"] == "(nir - red) / (nir + red)"
+-    assert [s["band"] for s in out["sources"]] == ["B08", "B04"]
++    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04"]
+     assert out["stats"]["max"] == pytest.approx(0.75, abs=1e-4)
+     assert out["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
+     assert out["negative_reflectance_fraction"] == 0.0
+@@ -147,6 +164,116 @@ def test_oversized_area_is_refused(synthetic: Synthetic, monkeypatch: pytest.Mon
+         call(synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI})
+ 
+ 
++@pytest.mark.req("R4")
++def test_every_numeric_tool_returns_a_complete_provenance_block(synthetic: Synthetic) -> None:
++    results = {
++        "search_stac": call(
++            synthetic, "search_stac", {"bbox": AOI, "start": "2026-09-01", "end": "2026-09-30"}
++        ),
++        "load_window": call(
++            synthetic,
++            "load_window",
++            {"item_id": "SYNTH_TOZEUR_L2A", "asset_key": "red", "bbox": AOI},
++        ),
++        "band_math": call(
++            synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
++        ),
++        "zonal_stats": call(
++            synthetic,
++            "zonal_stats",
++            {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "geometry": PALM_ZONE},
++        ),
++    }
++    for tool, out in results.items():
++        block = out["provenance"]
++        assert block["tool"]["name"] == tool
++        assert block["request"]["tool"] == tool
++        assert block["args_hash"].startswith("sha256:") and len(block["args_hash"]) == 71
++        assert block["spatial"]["aoi_geometry"]["type"] == "Polygon"
++        assert block["tool_trace"]["trace_id"] and block["tool_trace"]["duration_ms"] >= 0
++        assert block["outputs"], tool
++        if tool != "search_stac":
++            src = block["sources"][0]
++            assert src["item_id"] == "SYNTH_TOZEUR_L2A" and src["processing_level"] == "L2A"
++            assert src["processing_baseline"] == "05.11" and src["href"]
++            assert block["spatial"]["crs"] == "EPSG:32632"
++            assert block["computation"]["resampling"] == "none"
++    index = results["band_math"]["provenance"]["computation"]
++    assert (
++        index["parameters"]["clip_min"] == 0.0 and index["formula"] == "(nir - red) / (nir + red)"
++    )
++
++
++@pytest.mark.req("R5")
++def test_blocks_are_stored_and_retrievable_by_id_and_trace(synthetic: Synthetic) -> None:
++    store = MemoryStore()
++    out = call(
++        synthetic,
++        "band_math",
++        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI, "run_id": "run-42"},
++        store=store,
++    )
++    block = out["provenance"]
++    assert block["tool_trace"]["run_id"] == "run-42"
++    stored = store.by_trace(block["tool_trace"]["trace_id"])
++    assert [str(b.block_id) for b in stored] == [block["block_id"]]
++    fetched = call(synthetic, "get_provenance", {"block_id": block["block_id"]}, store=store)
++    assert fetched["block"]["args_hash"] == block["args_hash"] and fetched["replay"] is None
++
++
++@pytest.mark.req("R5")
++def test_replay_matches_when_data_is_unchanged(synthetic: Synthetic) -> None:
++    store = MemoryStore()
++    out = call(
++        synthetic,
++        "band_math",
++        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
++        store=store,
++    )
++    report = call(
++        synthetic,
++        "get_provenance",
++        {"block_id": out["provenance"]["block_id"], "replay": True},
++        store=store,
++    )["replay"]
++    assert report["matches"] is True and report["compared"] > 10 and not report["mismatches"]
++    assert (
++        len(store.by_trace(out["provenance"]["tool_trace"]["trace_id"])) == 1
++    )  # replay stores nothing new
++
++
++@pytest.mark.req("R5")
++def test_replay_detects_changed_source_data(synthetic: Synthetic) -> None:
++    store = MemoryStore()
++    out = call(
++        synthetic,
++        "band_math",
++        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
++        store=store,
++    )
++    path = synthetic.scene.assets["red"].href
++    with rasterio.open(path, "r+") as dataset:
++        data = dataset.read(1)
++        data[data == 1500] = 1700  # the "palm" red band changes after the answer was given
++        dataset.write(data, 1)
++    report = call(
++        synthetic,
++        "get_provenance",
++        {"block_id": out["provenance"]["block_id"], "replay": True},
++        store=store,
++    )["replay"]
++    assert report["matches"] is False
++    assert "ndvi.max" in {m["name"] for m in report["mismatches"]}
++
++
++@pytest.mark.req("R5")
++def test_unknown_block_id_is_a_readable_error(synthetic: Synthetic) -> None:
++    with pytest.raises(ToolError, match="no provenance block"):
++        call(synthetic, "get_provenance", {"block_id": "12345678-1234-5678-1234-567812345678"})
++    with pytest.raises(ToolError, match="badly formed"):
++        call(synthetic, "get_provenance", {"block_id": "not-a-uuid"})
++
++
+ @pytest.mark.req("R1")
+ def test_real_stdio_entrypoint_starts_and_answers() -> None:
+     """Spawn `python -m geo_evidence_mcp.server` like an MCP host would and call health."""
+diff --git a/tests/test_store.py b/tests/test_store.py
+new file mode 100644
+index 0000000..2e72679
+--- /dev/null
++++ b/tests/test_store.py
+@@ -0,0 +1,73 @@
++"""R5: provenance storage (memory always; PostgreSQL/PostGIS when TEST_DATABASE_URL is set)."""
++
++from __future__ import annotations
++
++import os
++import uuid
++from collections.abc import Iterator
++
++import psycopg
++import pytest
++
++from geo_evidence_mcp.store import MemoryStore, PostgresStore
++from tests.helpers import make_block
++
++DSN = os.environ.get("TEST_DATABASE_URL")
++
++
++@pytest.mark.req("R5")
++def test_memory_store_roundtrip_and_trace_lookup() -> None:
++    store = MemoryStore()
++    block = make_block([("ndvi.mean", 0.7, "index")])
++    store.save(block)
++    assert store.get(block.block_id) == block
++    assert store.get(uuid.uuid4()) is None
++    assert store.by_trace(block.tool_trace.trace_id) == [block]
++    assert store.by_trace("nope") == []
++
++
++@pytest.fixture
++def pg() -> Iterator[PostgresStore]:
++    if not DSN:
++        pytest.skip("set TEST_DATABASE_URL to run PostgreSQL tests")
++    store = PostgresStore(DSN)
++    store.ensure_schema()
++    yield store
++
++
++@pytest.mark.db
++@pytest.mark.req("R5")
++def test_postgres_roundtrip_is_lossless(pg: PostgresStore) -> None:
++    block = make_block([("ndvi.mean", 0.7220123456, "index")], run_id="run-7")
++    pg.save(block)
++    pg.save(block)  # idempotent
++    fetched = pg.get(block.block_id)
++    assert fetched == block
++    assert [b.block_id for b in pg.by_trace(block.tool_trace.trace_id)] == [block.block_id]
++    assert pg.get(uuid.uuid4()) is None
++
++
++@pytest.mark.db
++@pytest.mark.req("R5")
++def test_postgres_stores_the_aoi_as_a_queryable_geometry(pg: PostgresStore) -> None:
++    assert DSN is not None
++    block = make_block([("ndvi.mean", 0.7, "index")])
++    pg.save(block)
++    with psycopg.connect(DSN) as conn:
++        inside, outside, srid = conn.execute(
++            """
++            SELECT ST_Intersects(aoi, ST_SetSRID(ST_MakePoint(8.148, 33.902), 4326)),
++                   ST_Intersects(aoi, ST_SetSRID(ST_MakePoint(2.0, 36.0), 4326)),
++                   ST_SRID(aoi)
++            FROM provenance_blocks WHERE block_id = %s
++            """,
++            (block.block_id,),
++        ).fetchone() or (None, None, None)
++    assert (inside, outside, srid) == (True, False, 4326)
++
++
++@pytest.mark.db
++@pytest.mark.req("R5")
++def test_ensure_schema_is_idempotent(pg: PostgresStore) -> None:
++    pg.ensure_schema()
++    pg.ensure_schema()
+diff --git a/tests/test_validator.py b/tests/test_validator.py
+new file mode 100644
+index 0000000..fd0ee2e
+--- /dev/null
++++ b/tests/test_validator.py
+@@ -0,0 +1,93 @@
++"""R6: the post-hoc claim validator."""
++
++from __future__ import annotations
++
++import pytest
++
++from geo_evidence_mcp.provenance import ProvenanceBlock, Unit
++from geo_evidence_mcp.validator import extract_numbers, validate_claims
++from tests.helpers import make_block
++
++NDVI: list[tuple[str, float, Unit]] = [
++    ("ndvi.mean", 0.7220, "index"),
++    ("ndvi.max", 1.0, "index"),
++    ("zone.valid_pixels", 41612, "count"),
++    ("negative_reflectance_fraction", 0.384, "fraction"),
++    ("cloud_cover", 0.67, "percent"),
++]
++
++
++def ok(text: str, *blocks: ProvenanceBlock) -> bool:
++    return validate_claims(text, blocks or [make_block(NDVI)]).ok
++
++
++@pytest.mark.req("R6")
++def test_numbers_that_match_a_tool_output_are_supported() -> None:
++    report = validate_claims("Mean NDVI was 0.72 over 41,612 valid pixels.", [make_block(NDVI)])
++    assert report.ok
++    assert [c.status for c in report.checks] == ["supported", "supported"]
++    assert report.checks[0].matched is not None and "ndvi.mean" in report.checks[0].matched
++
++
++@pytest.mark.req("R6")
++def test_a_fabricated_number_is_flagged() -> None:
++    report = validate_claims("Mean NDVI was 0.65.", [make_block(NDVI)])
++    assert not report.ok
++    assert [m.text for m in report.unsupported] == ["0.65"]
++
++
++@pytest.mark.req("R6")
++def test_rounding_is_respected_in_both_directions() -> None:
++    block = make_block([("ndvi.mean", 0.74, "index")])
++    assert ok("NDVI about 0.7", block)  # 0.74 rounds to 0.7
++    assert not ok("NDVI about 0.8", block)  # it does not round to 0.8
++    assert not ok("NDVI about 0.75", block)  # more precise than the data allows
++
++
++@pytest.mark.req("R6")
++def test_percent_needs_a_fraction_or_percent_quantity() -> None:
++    assert ok("38.4% of pixels had negative reflectance")
++    assert ok("cloud cover was 0.67%")
++    assert not ok("NDVI was 72.2%")  # an index is not a percentage
++    assert not ok("38.4 of pixels were negative")  # bare 38.4 is not the fraction 0.384
++
++
++@pytest.mark.req("R6")
++def test_change_claims_are_checked_against_the_difference_of_two_blocks() -> None:
++    before = make_block([("ndvi.mean", 0.80, "index")])
++    after = make_block([("ndvi.mean", 0.50, "index")])
++    assert ok("NDVI dropped by 0.3 between the two dates", before, after)
++    assert ok("NDVI changed by -0.30", before, after)
++    assert not ok("NDVI dropped by 0.4", before, after)
++    assert not ok("NDVI dropped by 0.3", before)  # one block alone cannot support a change
++
++
++@pytest.mark.req("R6")
++def test_identifiers_dates_and_band_names_are_not_treated_as_claims() -> None:
++    text = (
++        "Scene S2C_32SMC_20260904_0_L2A (2026-09-04, EPSG:32632, bands B04 and B08, "
++        "baseline 05.12, [3f9a1c2e]) gave a mean NDVI of 0.72 in 2026."
++    )
++    report = validate_claims(text, [make_block(NDVI)])
++    assert report.ok, [c.mention.text for c in report.checks if c.status == "unsupported"]
++    assert any(c.status == "ignored" and c.mention.text == "2026" for c in report.checks)
++
++
++@pytest.mark.req("R6")
++def test_number_formats() -> None:
++    mentions = {m.text: m for m in extract_numbers("1,234 and 0,72 and 3.5 and \u22120.02 and 2-4")}
++    assert mentions["1,234"].value == 1234 and mentions["0,72"].value == 0.72
++    assert mentions["\u22120.02"].value == -0.02 and mentions["0,72"].decimals == 2
++    assert {"2", "4"} <= set(mentions)  # a range is two positive numbers, not "2" and "-4"
++
++
++@pytest.mark.req("R6")
++def test_small_integers_are_flagged_unless_explicitly_allowed() -> None:
++    block = make_block(NDVI)
++    assert not validate_claims("I used 2 bands.", [block]).ok
++    assert validate_claims("I used 2 bands.", [block], ignore_integers_up_to=10).ok
++
++
++@pytest.mark.req("R6")
++def test_text_without_numbers_is_ok() -> None:
++    assert validate_claims("The oasis looks healthy.", [make_block(NDVI)]).ok

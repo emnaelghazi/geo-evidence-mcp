@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import quote
 
 from pydantic import SecretStr
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     postgres_db: str = "gem"
     db_host: str = "localhost"
     db_port: int = 5432
+
+    # Where provenance blocks are stored: "memory" (tests, quick local use) or "postgres" (R5).
+    store_backend: Literal["memory", "postgres"] = "memory"
 
     # Data access.
     # TODO(M1): verify the Earth Search endpoint and collection names against the live API.

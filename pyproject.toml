@@ -27,6 +27,7 @@ dependencies = [
   "pystac==1.16.0",
   "pystac-client==0.9.1",
   "fastmcp==2.14.7",
+  "psycopg[binary]==3.3.8",
   "affine==3.0.1",
 ]
 
@@ -34,6 +35,7 @@ dependencies = [
 gem-init-env = "geo_evidence_mcp.init_env:main"
 gem-m1-check = "geo_evidence_mcp.m1_check:main"
 gem-mcp = "geo_evidence_mcp.server:main"
+gem-export-schema = "geo_evidence_mcp.export_schema:main"
 
 [dependency-groups]
 dev = [
@@ -65,6 +67,7 @@ addopts = "-ra --strict-markers"
 markers = [
   "req(id): maps a test to a requirement ID (R1-R17) from the project brief",
   "integration: hits live services (needs network); run with RUN_INTEGRATION=1",
+  "db: needs PostgreSQL+PostGIS; set TEST_DATABASE_URL to run",
 ]
 
 [[tool.mypy.overrides]]

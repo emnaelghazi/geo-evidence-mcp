@@ -1,4 +1,4 @@
-"""Typed tool results. `sources` mirrors the draft provenance schema (full block in M3)."""
+"""Typed tool results. Every numeric result carries its provenance block (R4)."""
 
 from __future__ import annotations
 
@@ -7,23 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from geo_evidence_mcp.provenance import ProvenanceBlock
 from geo_evidence_mcp.zonal import ZonalStats
-
-
-class SourceRef(BaseModel):
-    """One asset a number was computed from."""
-
-    item_id: str
-    collection: str
-    asset_key: str
-    band: str | None
-    href: str
-    datetime: datetime
-    processing_baseline: str | None
-    cloud_cover: float | None
-    scale: float
-    offset: float
-    nodata: float | None
 
 
 class GridInfo(BaseModel):
@@ -49,12 +34,13 @@ class SearchResult(BaseModel):
     count: int
     max_cloud: float
     scenes: list[SceneBrief]  # least cloudy first
+    provenance: ProvenanceBlock
 
 
 class WindowResult(BaseModel):
-    sources: list[SourceRef]
     grid: GridInfo
     stats: ZonalStats  # of the physical values (reflectance for optical bands)
+    provenance: ProvenanceBlock
 
 
 class IndexResult(BaseModel):
@@ -62,7 +48,27 @@ class IndexResult(BaseModel):
     formula: str
     clip_min: float  # reflectance is clipped to this value before the ratio
     zone: Literal["bbox", "polygon"]
-    sources: list[SourceRef]
     grid: GridInfo
     negative_reflectance_fraction: float  # share of in-zone pixels clipped (either band < 0)
     stats: ZonalStats
+    provenance: ProvenanceBlock
+
+
+class ReplayMismatch(BaseModel):
+    name: str
+    subject: str | None
+    stored: float
+    replayed: float
+
+
+class ReplayReport(BaseModel):
+    matches: bool
+    compared: int
+    mismatches: list[ReplayMismatch]
+    missing_in_replay: list[str]
+    extra_in_replay: list[str]
+
+
+class ProvenanceLookup(BaseModel):
+    block: ProvenanceBlock
+    replay: ReplayReport | None = None

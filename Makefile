@@ -1,4 +1,4 @@
-.PHONY: install init lint fmt type test check up up-obs down eval-fast eval m1-check test-live
+.PHONY: install init lint fmt type test check up up-obs down eval-fast eval m1-check test-live test-db
 
 install:
 	uv sync
@@ -39,3 +39,6 @@ m1-check:
 
 test-live:
 	RUN_INTEGRATION=1 uv run pytest -m integration -s
+
+test-db:
+	uv run pytest -m db -q
