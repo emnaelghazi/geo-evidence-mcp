@@ -48,6 +48,8 @@ class IndexResult(BaseModel):
     formula: str
     clip_min: float  # reflectance is clipped to this value before the ratio
     zone: Literal["bbox", "polygon"]
+    cloud_mask: Literal["scl", "none"]
+    cloud_masked_fraction: float  # share of valid in-zone pixels removed by the SCL cloud mask
     grid: GridInfo
     negative_reflectance_fraction: float  # share of in-zone pixels clipped (either band < 0)
     stats: ZonalStats

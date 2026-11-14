@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ValidationError
 
 from geo_evidence_mcp import service
+from geo_evidence_mcp.agent.capabilities import check_plan, check_question
 from geo_evidence_mcp.agent.llm import AgentModel, PlanError
 from geo_evidence_mcp.agent.plan import Plan
 from geo_evidence_mcp.agent.tracing import NullTracer, Tracer
@@ -49,6 +50,7 @@ class AgentAnswer(BaseModel):
     plan: Plan | None
     validation_ok: bool
     unsupported_numbers: list[str]
+    confidence: Literal["normal", "low"]
     model: str
 
     def render(self) -> str:
@@ -76,6 +78,7 @@ class State(TypedDict, total=False):
     attempts: int
     feedback: str | None
     unsupported: list[str]
+    low_confidence: bool
     template_used: bool
     final: AgentAnswer
 
@@ -169,6 +172,11 @@ class _Run:
                 reason = f"Please ask a question of up to {MAX_QUESTION_CHARS} characters."
                 sp.set_output({"refusal": reason})
                 return self._refuse(reason)
+            blocking = [c for c in check_question(question, self.today) if c.severity == "refuse"]
+            if blocking:
+                reason = " ".join(c.message for c in blocking)
+                sp.set_output({"refusal": reason, "codes": [c.code for c in blocking]})
+                return self._refuse(reason)
             sp.set_output({"ok": True})
             return {"question": question}
 
@@ -219,8 +227,21 @@ class _Run:
                         f"[west, south, east, north], or use a known place: {known}."
                     )
                 box = named
+            concerns = check_plan(
+                [(p.start, p.end) for p in plan.periods],
+                box,
+                self.today,
+                change=plan.task == "index_change",
+            )
+            if blocking := [c for c in concerns if c.severity == "refuse"]:
+                sp.set_output({"codes": [c.code for c in blocking]})
+                return self._refuse(" ".join(c.message for c in blocking))
             blocks = list(state.get("blocks", []))
             caveats = list(state.get("caveats", []))
+            low_confidence = state.get("low_confidence", False)
+            for concern in concerns:
+                caveats.append(f"Low confidence: {concern.message}")
+                low_confidence = True
             scenes: list[dict[str, Any]] = []
             for period in plan.periods:
                 chosen = None
@@ -260,6 +281,7 @@ class _Run:
                 "scenes": scenes,
                 "blocks": blocks,
                 "caveats": caveats,
+                "low_confidence": low_confidence,
             }
 
     async def analyze(self, state: State) -> dict[str, Any]:
@@ -268,6 +290,7 @@ class _Run:
             blocks = list(state["blocks"])
             caveats = list(state["caveats"])
             analysed: list[ProvenanceBlock] = []
+            low_confidence = state.get("low_confidence", False)
             for scene in state["scenes"]:
                 data = await self._tool(
                     "band_math",
@@ -276,14 +299,18 @@ class _Run:
                         "index": plan.index,
                         "bbox": state["bbox"],
                         "collection": service.DEFAULT_COLLECTION,
+                        "cloud_mask": "scl",
                     },
                 )
                 block = ProvenanceBlock.model_validate(data["provenance"])
-                if data["stats"]["mean"] is None:
-                    return self._refuse(
-                        f"Scene {scene['item_id']} has no valid pixels over this area."
-                    )
                 blocks.append(block)
+                if data["stats"]["mean"] is None:
+                    return {
+                        "blocks": blocks,
+                        **self._refuse(
+                            f"Scene {scene['item_id']} has no valid pixels over this area."
+                        ),
+                    }
                 analysed.append(block)
                 if data["grid"]["clipped"]:
                     caveats.append(
@@ -295,6 +322,15 @@ class _Run:
                         f"{negative:.0%} of pixels had slightly negative reflectance "
                         "and were clipped to zero before computing the index."
                     )
+                cloudy = data["cloud_masked_fraction"]
+                if cloudy > 0.5:
+                    low_confidence = True
+                    caveats.append(
+                        f"Low confidence: {cloudy:.0%} of the area was cloud, shadow or cirrus and "
+                        "was excluded, so the statistics rest on a minority of the area."
+                    )
+                elif cloudy > 0.2:
+                    caveats.append(f"{cloudy:.0%} of the area was cloudy and was excluded.")
                 if data["stats"]["valid_fraction"] < 0.8:
                     caveats.append(
                         f"Only {data['stats']['valid_fraction']:.0%} of the area had valid pixels."
@@ -308,7 +344,11 @@ class _Run:
                         "the difference may be seasonal rather than a real change."
                     )
             sp.set_output({"block_ids": [str(b.block_id) for b in analysed]})
-            return {"blocks": blocks, "caveats": list(dict.fromkeys(caveats))}
+            return {
+                "blocks": blocks,
+                "caveats": list(dict.fromkeys(caveats)),
+                "low_confidence": low_confidence,
+            }
 
     async def check_evidence(self, state: State) -> dict[str, Any]:
         with self.tracer.span("check_evidence") as sp:
@@ -392,6 +432,7 @@ class _Run:
             plan=state.get("plan"),
             validation_ok=not refused and not state.get("template_used", False),
             unsupported_numbers=state.get("unsupported", []),
+            confidence="low" if state.get("low_confidence") else "normal",
             model=self.model.name,
         )
         return {"final": final}

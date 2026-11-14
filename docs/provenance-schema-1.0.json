@@ -35,8 +35,11 @@
           "type": "object"
         },
         "resampling": {
-          "const": "none",
           "default": "none",
+          "enum": [
+            "none",
+            "nearest_scl_to_10m"
+          ],
           "title": "Resampling",
           "type": "string"
         }

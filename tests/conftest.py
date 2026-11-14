@@ -43,6 +43,7 @@ class Synthetic:
     transform: Affine
     split_col: int
     hole: tuple[slice, slice]
+    scl: np.ndarray
 
 
 def _write(path: Path, data: np.ndarray, transform_: Affine) -> None:
@@ -69,10 +70,12 @@ def make_scene(
     when: datetime | None = None,
     palm_nir: int = PALM_NIR,
     cloud: float = 1.0,
+    cloud_cells: tuple[slice, slice] | None = None,
+    cloud_dn: int | None = None,
 ) -> Synthetic:
     dn = {"red": (1500, 3500), "nir": (palm_nir, 4000), "green": (1800, 3300)}
     folder = tmp_path / item_id
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(parents=True, exist_ok=True)
     (cx,), (cy,) = transform(
         "EPSG:4326",
         CRS,
@@ -92,10 +95,32 @@ def make_scene(
         data[:, :split_col] = palm
         if band in ("red", "nir"):
             data[hole] = 0  # nodata
+            if cloud_cells is not None and cloud_dn is not None:  # bright cloud pixels
+                rows, cols = cloud_cells
+                data[rows.start * 2 : rows.stop * 2, cols.start * 2 : cols.stop * 2] = cloud_dn
         path = folder / f"{band}.tif"
         _write(path, data, transform_)
         assets[band] = AssetRef(href=str(path), scale=1e-4, offset=offset, nodata=0.0)
 
+    # Scene classification at 20 m on the same origin: 4 = vegetation, 9 = cloud (high probability).
+    scl = np.full((SIZE // 2, SIZE // 2), 4, dtype="uint8")
+    if cloud_cells is not None:
+        scl[cloud_cells] = 9
+    scl_path = folder / "scl.tif"
+    with rasterio.open(
+        scl_path,
+        "w",
+        driver="GTiff",
+        height=scl.shape[0],
+        width=scl.shape[1],
+        count=1,
+        dtype="uint8",
+        crs=CRS,
+        transform=Affine(20.0, 0.0, x0, 0.0, -20.0, y0),
+        nodata=0,
+    ) as dst:
+        dst.write(scl, 1)
+    assets["scl"] = AssetRef(href=str(scl_path), scale=1.0, offset=0.0, nodata=0.0)
     scene = SceneSummary(
         item_id=item_id,
         collection="sentinel-2-l2a",
@@ -105,7 +130,7 @@ def make_scene(
         epsg=32632,
         assets=assets,
     )
-    return Synthetic(scene=scene, transform=transform_, split_col=split_col, hole=hole)
+    return Synthetic(scene=scene, transform=transform_, split_col=split_col, hole=hole, scl=scl)
 
 
 @pytest.fixture

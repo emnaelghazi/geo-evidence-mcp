@@ -73,7 +73,9 @@ class Computation(_Strict):
     operation: Operation
     formula: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
-    resampling: Literal["none"] = "none"  # all reads are on the native grid
+    # "none": every read is on its native grid. "nearest_scl_to_10m": the 20 m SCL cloud mask is
+    # resampled to the 10 m grid with nearest neighbour; the spectral bands are never resampled.
+    resampling: Literal["none", "nearest_scl_to_10m"] = "none"
     nodata_policy: str
 
 

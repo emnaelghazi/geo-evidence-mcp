@@ -31,6 +31,10 @@ BBoxArg = Annotated[
 ]
 IndexArg = Annotated[Literal["ndvi", "ndwi"], Field(description="Spectral index to compute")]
 ItemIdArg = Annotated[str, Field(description="STAC item id, e.g. from search_stac")]
+CloudMaskArg = Annotated[
+    Literal["scl", "none"],
+    Field(description="scl: drop cloud, shadow, cirrus and defective pixels using the SCL layer"),
+]
 RunIdArg = Annotated[
     str | None, Field(description="Optional agent run id, stored in the trace to correlate calls")
 ]
@@ -120,6 +124,7 @@ def build_server(
         index: IndexArg,
         bbox: BBoxArg,
         collection: str = service.DEFAULT_COLLECTION,
+        cloud_mask: CloudMaskArg = "scl",
         run_id: RunIdArg = None,
     ) -> IndexResult:
         """Compute NDVI or NDWI for a scene over a bounding box, with summary statistics."""
@@ -129,6 +134,7 @@ def build_server(
                 index,
                 bbox=_bbox(bbox),
                 collection=collection,
+                cloud_mask=cloud_mask,
                 client=client,
                 store=blocks,
                 run_id=run_id,
@@ -141,6 +147,7 @@ def build_server(
         index: IndexArg,
         geometry: GeometryArg,
         collection: str = service.DEFAULT_COLLECTION,
+        cloud_mask: CloudMaskArg = "scl",
         run_id: RunIdArg = None,
     ) -> IndexResult:
         """Compute NDVI or NDWI statistics inside a polygon (pixel centres inside the polygon)."""
@@ -150,6 +157,7 @@ def build_server(
                 index,
                 geometry=geometry,
                 collection=collection,
+                cloud_mask=cloud_mask,
                 client=client,
                 store=blocks,
                 run_id=run_id,

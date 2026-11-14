@@ -115,6 +115,7 @@ class ScriptedModel:
         self._plan_for = plan_for
         self._narrate_with = narrate_with
         self.narrate_calls = 0
+        self.plan_calls = 0
         self.feedback_seen: list[str | None] = []
 
     @property
@@ -122,6 +123,7 @@ class ScriptedModel:
         return "scripted"
 
     async def plan(self, question: str, *, today: date, known_places: list[str]) -> Plan:
+        self.plan_calls += 1
         return self._plan_for(question)
 
     async def narrate(self, question: str, evidence: str, *, feedback: str | None) -> str:

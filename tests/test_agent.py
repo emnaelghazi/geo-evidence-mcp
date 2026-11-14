@@ -302,3 +302,102 @@ def test_plan_validation() -> None:
         Plan(task="index_change", index="ndvi", place="x", periods=[SEPT_2026, SEPT_2026])
     plan = Plan(task="index_change", index="ndvi", place="x", periods=[SEPT_2026, SEPT_2025])
     assert [p.start.year for p in plan.periods] == [2025, 2026]  # sorted chronologically
+
+
+# ---- M5: systematic refusals and low-confidence flags -------------------------------------
+@pytest.mark.req("R3")
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show me NDVI at 1 m resolution for the Tozeur oasis.",
+        "Forecast the NDVI of the Tozeur oasis for next year.",
+        "What was the temperature in Tozeur in July 2026?",
+        "How many palm trees are in the Tozeur oasis?",
+    ],
+)
+def test_traps_are_refused_before_the_model_is_called(world: World, question: str) -> None:
+    def must_not_plan(_: str) -> Plan:
+        raise AssertionError("the model should not be consulted for a trap")
+
+    model = ScriptedModel(must_not_plan, faithful)
+    answer = world.ask(question, model)
+    assert answer.status == "refused" and model.plan_calls == 0
+    assert answer.block_ids == [] and answer.confidence == "normal"
+
+
+@pytest.mark.req("R3")
+def test_oversized_area_is_refused_before_any_search(world: World) -> None:
+    q = "NDVI of the whole region 8.0,33.0,8.5,33.5 in September 2026?"
+    plan = Plan(task="index_value", index="ndvi", bbox=[8.0, 33.0, 8.5, 33.5], periods=[SEPT_2026])
+    answer = world.ask(q, model_for({q: plan}))
+    assert answer.status == "refused" and "km2" in answer.answer and answer.block_ids == []
+
+
+@pytest.mark.req("R3")
+def test_future_period_chosen_by_the_model_is_still_refused(world: World) -> None:
+    q = "NDVI of the Tozeur oasis in January 2027?"
+    period = Period(start=date(2027, 1, 1), end=date(2027, 1, 31))
+    answer = world.ask(q, model_for({q: value_plan(period=period)}))
+    assert answer.status == "refused" and "future" in answer.answer and answer.block_ids == []
+
+
+@pytest.mark.req("R3")
+def test_tiny_area_is_answered_but_flagged_low_confidence(world: World) -> None:
+    q = "NDVI at 8.1400,33.9000,8.1405,33.9005 in September 2026?"
+    plan = Plan(
+        task="index_value", index="ndvi", bbox=[8.14, 33.9, 8.1405, 33.9005], periods=[SEPT_2026]
+    )
+    answer = world.ask(q, model_for({q: plan}))
+    assert answer.status == "answered" and answer.confidence == "low"
+    assert any(
+        c.startswith("Low confidence:") and "fewer than 100 pixels" in c for c in answer.caveats
+    )
+
+
+def _cloudy_agent_world(tmp_path: Path, fraction: float) -> World:
+    from geo_evidence_mcp.aoi import TOZEUR
+    from geo_evidence_mcp.raster import load_window
+
+    probe = make_scene(tmp_path / "probe")
+    col, _row, width, _height = load_window(probe.scene, "red", TOZEUR).window
+    last = col // 2 + int(width / 2 * fraction)
+    cells = (slice(0, 225), slice(0, last))  # the whole tile's rows, columns up to `last`
+    world = World(tmp_path / "w")
+    cloudy = make_scene(
+        tmp_path / "cloud",
+        item_id="S2_CLOUDY",
+        when=datetime(2026, 9, 20, 10, tzinfo=UTC),
+        cloud_cells=cells,
+        cloud_dn=9000,
+    )
+    world.server = build_server(
+        client=FakeCatalog([scene_to_item(cloudy.scene)]), store=world.store
+    )
+    return world
+
+
+@pytest.mark.req("R3")
+def test_heavy_cloud_cover_lowers_confidence_and_is_explained(tmp_path: Path) -> None:
+    world = _cloudy_agent_world(tmp_path, 0.7)
+    q = "NDVI of the Tozeur oasis in September 2026?"
+    answer = world.ask(q, model_for({q: value_plan()}))
+    assert answer.status == "answered" and answer.confidence == "low"
+    assert any("Low confidence" in c and "cloud, shadow or cirrus" in c for c in answer.caveats)
+
+
+@pytest.mark.req("R3")
+def test_moderate_cloud_cover_is_a_caveat_not_a_low_confidence_flag(tmp_path: Path) -> None:
+    world = _cloudy_agent_world(tmp_path, 0.3)
+    q = "NDVI of the Tozeur oasis in September 2026?"
+    answer = world.ask(q, model_for({q: value_plan()}))
+    assert answer.status == "answered" and answer.confidence == "normal"
+    assert any("was cloudy and was excluded" in c for c in answer.caveats)
+
+
+@pytest.mark.req("R3")
+def test_fully_cloudy_scene_is_refused_with_its_evidence_kept(tmp_path: Path) -> None:
+    world = _cloudy_agent_world(tmp_path, 2.0)
+    q = "NDVI of the Tozeur oasis in September 2026?"
+    answer = world.ask(q, model_for({q: value_plan()}))
+    assert answer.status == "refused" and "no valid pixels" in answer.answer
+    assert len(answer.block_ids) == 2  # the search and the (empty) analysis stay on record

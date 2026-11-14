@@ -1,0 +1,1148 @@
+diff --git a/README.md b/README.md
+index 11b9a4e..99e7a30 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@ An MCP server and agent for Earth-observation questions where **every numeric an
+ machine-checkable provenance**: STAC item, collection, band, CRS, acquisition time, processing level
+ and a replayable tool-call trace.
+ 
+-Status: **M4 agent**. The refusal logic (M5) and the benchmark (M6) are not built yet.
++Status: **M5 refusals and cloud masking**. The benchmark (M6) and the comparison run (M7) are not built yet.
+ 
+ | Milestone | Scope | State |
+ |---|---|---|
+@@ -13,7 +13,7 @@ Status: **M4 agent**. The refusal logic (M5) and the benchmark (M6) are not buil
+ | M2 | FastMCP server (`health`, `search_stac`, `load_window`, `band_math`, `zonal_stats`) | done; live MCP test passed |
+ | M3 | Provenance block, PostGIS storage, `get_provenance` + replay, claim validator | code + tests done (PostgreSQL tested here); CI database job PENDING |
+ | M4 | LangGraph agent (scripted-model tests) + Langfuse tracing adapter | code + offline tests done; live Claude run PENDING |
+-| M5 | Refusal / low-confidence logic | pending |
++| M5 | Deterministic refusals, low-confidence flags, SCL cloud masking | code + offline tests done |
+ | M6 | Benchmark + eval runner | pending |
+ | M7 | Naive vs provenance comparison | pending |
+ | M8 | Polish, demo, v0.1.0 | pending |
+diff --git a/docs/adr/ADR-004-provenance-schema-and-claim-validation.md b/docs/adr/ADR-004-provenance-schema-and-claim-validation.md
+index 2808fa6..a123719 100644
+--- a/docs/adr/ADR-004-provenance-schema-and-claim-validation.md
++++ b/docs/adr/ADR-004-provenance-schema-and-claim-validation.md
+@@ -19,6 +19,9 @@ EPSG:4326, resolution, size, clipped), `computation` (operation, formula, parame
+ nodata policy), `outputs` (named, typed, unit-tagged numbers) and `tool_trace` (trace id, span id,
+ optional agent run id, start, duration).
+ 
++M5 amendment: `computation.resampling` may be `nearest_scl_to_10m` when the SCL cloud mask is used
++(ADR-006); the schema file was regenerated.
++
+ **Hash.** `args_hash` is SHA-256 over canonical JSON of `{tool, args}` (sorted keys, floats rounded
+ to 6 decimals), so key order and float noise do not change it.
+ 
+diff --git a/docs/adr/ADR-006-cloud-masking-and-capability-checks.md b/docs/adr/ADR-006-cloud-masking-and-capability-checks.md
+new file mode 100644
+index 0000000..15f8d4c
+--- /dev/null
++++ b/docs/adr/ADR-006-cloud-masking-and-capability-checks.md
+@@ -0,0 +1,44 @@
++# ADR-006: Cloud masking and deterministic capability checks
++
++- Status: Accepted
++- Date: 2026-11-14
++
++## Cloud masking (SCL)
++
++Until M4 a "20% cloud" scene still let cloud, shadow and cirrus pixels into the statistics. Index tools
++(`band_math`, `zonal_stats`) now take `cloud_mask` = `scl` (default) or `none`.
++
++- Classes masked: 1 saturated/defective, 3 cloud shadow, 8 and 9 cloud (medium/high probability),
++  10 thin cirrus; class 0 (no data) always. Snow (11) and vegetation/water classes are kept.
++- The 20 m SCL is resampled to the 10 m grid with nearest neighbour (each 10 m pixel takes the class of
++  the 20 m cell containing it). The spectral bands are never resampled. A test checks the result
++  pixel for pixel against an independent upsampling, including windows that start mid-cell.
++- Provenance records `cloud_mask`, `scl_masked_classes`, `computation.resampling =
++  "nearest_scl_to_10m"` (a schema change, regenerated into `docs/provenance-schema-1.0.json`), the SCL
++  asset as a source, and the output `cloud_masked_fraction`.
++- Backward compatibility: a recorded call without `cloud_mask` (made before M5) replays with
++  `cloud_mask="none"`, which is what produced its numbers.
++
++## Capability checks (`agent/capabilities.py`)
++
++R3 must not depend on the model noticing a trap, so two code-level checks run first:
++
++- `check_question` (before any model call): resolution finer than 10 m, sub-metre wording, forecasts
++  and future years, quantities optical imagery cannot give (temperature, rainfall, soil moisture,
++  yield, population, air quality, elevation, biomass), object counting. 21 trap questions and 10
++  look-alike legitimate questions are tested.
++- `check_plan` (after the model's plan, before data is fetched): area over 400 km2 or under 4 pixels,
++  future periods, periods before Sentinel-2 existed. Warnings (under 100 pixels; a single scene
++  standing in for a period over a year) lower confidence instead of refusing.
++- Low confidence is explicit in the answer (`confidence = "low"` plus a caveat) when the area is tiny
++  or more than half of it was cloud. Between 20% and 50% cloud it is a caveat only. A fully masked
++  scene is refused, and its search and analysis blocks stay on record.
++
++## Limits
++
++- The text rules are heuristics. They are deliberately conservative: a trap phrased in an unusual way
++  can reach the model, where the plan's `unsupported` option and the validator are the next lines of
++  defence. False positives are guarded by a list of legitimate look-alike questions, not proven absent.
++- SCL is itself a model output; its errors (for example bright desert flagged as cloud) are not
++  corrected. The masked fraction is reported so a reader can see when that matters.
++- A tile-wide 400 km2 limit equals the pixel cap used when reading (4,000,000 pixels at 10 m).
+diff --git a/docs/provenance-schema-1.0.json b/docs/provenance-schema-1.0.json
+index 095febc..3317155 100644
+--- a/docs/provenance-schema-1.0.json
++++ b/docs/provenance-schema-1.0.json
+@@ -35,8 +35,11 @@
+           "type": "object"
+         },
+         "resampling": {
+-          "const": "none",
+           "default": "none",
++          "enum": [
++            "none",
++            "nearest_scl_to_10m"
++          ],
+           "title": "Resampling",
+           "type": "string"
+         }
+diff --git a/src/geo_evidence_mcp/agent/capabilities.py b/src/geo_evidence_mcp/agent/capabilities.py
+new file mode 100644
+index 0000000..f13a9b9
+--- /dev/null
++++ b/src/geo_evidence_mcp/agent/capabilities.py
+@@ -0,0 +1,189 @@
++"""What this system can and cannot answer, checked in code (R3).
++
++These checks do not depend on the language model's judgment: a question that asks for something
++Sentinel-2 L2A cannot give is refused here, before any model call, and a plan that cannot be
++served is refused or flagged as low confidence before any data is fetched.
++"""
++
++from __future__ import annotations
++
++import math
++import re
++from dataclasses import dataclass
++from datetime import date
++from typing import Literal
++
++from geo_evidence_mcp.models import BBox
++from geo_evidence_mcp.service import MAX_WINDOW_PIXELS
++
++PIXEL_SIZE_M = 10.0
++SENSOR_START = date(2015, 6, 23)  # Sentinel-2A launch: nothing earlier exists
++MAX_AOI_KM2 = MAX_WINDOW_PIXELS * PIXEL_SIZE_M**2 / 1e6  # 400 km2
++MIN_AOI_KM2 = 4 * PIXEL_SIZE_M**2 / 1e6  # four pixels
++LOW_CONFIDENCE_AOI_KM2 = 100 * PIXEL_SIZE_M**2 / 1e6  # under a hundred pixels
++LONG_WINDOW_DAYS = 366
++
++SUPPORTED = (
++    "vegetation greenness (NDVI) and open water (NDWI) from Sentinel-2 optical imagery at 10 m"
++)
++
++
++@dataclass(frozen=True)
++class Concern:
++    code: str
++    severity: Literal["refuse", "warn"]
++    message: str
++
++
++_UNITS_M = {"mm": 0.001, "cm": 0.01, "centimetre": 0.01, "centimeter": 0.01, "m": 1.0}
++_SIZE = re.compile(
++    r"(?P<n>\d+(?:[.,]\d+)?)\s*(?P<unit>mm|cm|centi?met(?:re|er)s?|met(?:re|er)s?|m)\b", re.I
++)
++_RESOLUTION_WORDS = re.compile(r"resolution|per pixel|pixel size|\bpixels?\b|\bgsd\b|detail", re.I)
++_SUBMETRE = re.compile(
++    r"sub[- ]?(?:met(?:re|er)|pixel)|centi?met(?:re|er)[- ]?(?:level|scale|accura|resolution)",
++    re.I,
++)
++_FUTURE = re.compile(
++    r"\b(?:forecast\w*|predict\w*|projection\w*|will (?:be|become|have|look|grow|turn)|"
++    r"going to be|next (?:year|month|season|decade)|in the future)\b",
++    re.I,
++)
++_YEAR = re.compile(r"\b(20\d{2})\b")
++_UNSUPPORTED_QUANTITY = re.compile(
++    r"\b(temperature|rain(?:fall)?|precipitation|humidity|wind|soil moisture|crop yield|yield|"
++    r"population|pollution|air quality|co2|methane|elevation|altitude|biomass|carbon|"
++    r"snow depth|sea level)\b",
++    re.I,
++)
++_COUNTING = re.compile(
++    r"\bhow many (?:cars?|vehicles?|trees?|palms?|palm trees?|buildings?|houses?|people|persons?|"
++    r"boats?|ships?|animals?|sheep|camels?)\b",
++    re.I,
++)
++
++
++def _sentences(text: str) -> list[str]:
++    return [s for s in re.split(r"(?<=[.!?])\s+", text) if s]
++
++
++def check_question(question: str, today: date) -> list[Concern]:
++    """Refuse requests that no Sentinel-2 L2A analysis can serve. Pure text rules, no model."""
++    concerns: list[Concern] = []
++
++    for sentence in _sentences(question):
++        if _SUBMETRE.search(sentence):
++            concerns.append(_too_fine("sub-metre detail"))
++            continue
++        if not _RESOLUTION_WORDS.search(sentence):
++            continue
++        for match in _SIZE.finditer(sentence):
++            unit = match.group("unit").lower()
++            metres = float(match.group("n").replace(",", ".")) * _UNITS_M.get(
++                unit if unit in _UNITS_M else ("m" if unit.startswith("met") else "cm"), 1.0
++            )
++            if metres < PIXEL_SIZE_M:
++                concerns.append(_too_fine(match.group(0)))
++                break
++
++    years = [int(y) for y in _YEAR.findall(question)]
++    if _FUTURE.search(question) or any(y > today.year for y in years):
++        concerns.append(
++            Concern(
++                "future",
++                "refuse",
++                "I can only report what satellites have already observed, not forecasts or "
++                "future conditions.",
++            )
++        )
++    if match_q := _UNSUPPORTED_QUANTITY.search(question):
++        concerns.append(
++            Concern(
++                "unsupported_quantity",
++                "refuse",
++                f"'{match_q.group(0)}' can't be measured from Sentinel-2 optical imagery. "
++                f"I can report {SUPPORTED}.",
++            )
++        )
++    if match_c := _COUNTING.search(question):
++        concerns.append(
++            Concern(
++                "object_counting",
++                "refuse",
++                f"Counting individual objects ('{match_c.group(0)}') needs far finer imagery than "
++                f"Sentinel-2's {PIXEL_SIZE_M:.0f} m pixels.",
++            )
++        )
++    return concerns
++
++
++def _too_fine(what: str) -> Concern:
++    return Concern(
++        "resolution_too_fine",
++        "refuse",
++        f"Sentinel-2 pixels are {PIXEL_SIZE_M:.0f} m wide, so details like '{what}' can't be "
++        "resolved.",
++    )
++
++
++def bbox_area_km2(bbox: BBox) -> float:
++    mid_lat = math.radians((bbox.south + bbox.north) / 2)
++    width = (bbox.east - bbox.west) * 111.32 * math.cos(mid_lat)
++    height = (bbox.north - bbox.south) * 110.57
++    return abs(width * height)
++
++
++def check_plan(
++    periods: list[tuple[date, date]], bbox: BBox, today: date, *, change: bool
++) -> list[Concern]:
++    """Check a resolved plan (area and dates) before any data is fetched."""
++    concerns: list[Concern] = []
++    area = bbox_area_km2(bbox)
++    if area > MAX_AOI_KM2:
++        concerns.append(
++            Concern(
++                "area_too_large",
++                "refuse",
++                f"That area is about {area:,.0f} km2; I handle up to {MAX_AOI_KM2:,.0f} km2 "
++                "(roughly 20 x 20 km). Please choose a smaller area.",
++            )
++        )
++    elif area < MIN_AOI_KM2:
++        concerns.append(
++            Concern(
++                "area_too_small",
++                "refuse",
++                f"That area covers fewer than 4 Sentinel-2 pixels ({PIXEL_SIZE_M:.0f} m each).",
++            )
++        )
++    elif area < LOW_CONFIDENCE_AOI_KM2:
++        concerns.append(
++            Concern(
++                "few_pixels",
++                "warn",
++                "The area covers fewer than 100 pixels, so the statistics are noisy.",
++            )
++        )
++    for start, end in periods:
++        if start > today:
++            concerns.append(
++                Concern("future_period", "refuse", f"{start} is in the future; no data exists yet.")
++            )
++        elif end < SENSOR_START:
++            concerns.append(
++                Concern(
++                    "before_sensor",
++                    "refuse",
++                    f"Sentinel-2 began observing on {SENSOR_START}; {start} to {end} is earlier.",
++                )
++            )
++        elif (end - start).days > LONG_WINDOW_DAYS and not change:
++            concerns.append(
++                Concern(
++                    "long_window",
++                    "warn",
++                    "The period is longer than a year, but one scene is used; it may not represent "
++                    "the whole period.",
++                )
++            )
++    return concerns
+diff --git a/src/geo_evidence_mcp/agent/graph.py b/src/geo_evidence_mcp/agent/graph.py
+index 93373e8..1a1050a 100644
+--- a/src/geo_evidence_mcp/agent/graph.py
++++ b/src/geo_evidence_mcp/agent/graph.py
+@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
+ from pydantic import BaseModel, ValidationError
+ 
+ from geo_evidence_mcp import service
++from geo_evidence_mcp.agent.capabilities import check_plan, check_question
+ from geo_evidence_mcp.agent.llm import AgentModel, PlanError
+ from geo_evidence_mcp.agent.plan import Plan
+ from geo_evidence_mcp.agent.tracing import NullTracer, Tracer
+@@ -49,6 +50,7 @@ class AgentAnswer(BaseModel):
+     plan: Plan | None
+     validation_ok: bool
+     unsupported_numbers: list[str]
++    confidence: Literal["normal", "low"]
+     model: str
+ 
+     def render(self) -> str:
+@@ -76,6 +78,7 @@ class State(TypedDict, total=False):
+     attempts: int
+     feedback: str | None
+     unsupported: list[str]
++    low_confidence: bool
+     template_used: bool
+     final: AgentAnswer
+ 
+@@ -169,6 +172,11 @@ class _Run:
+                 reason = f"Please ask a question of up to {MAX_QUESTION_CHARS} characters."
+                 sp.set_output({"refusal": reason})
+                 return self._refuse(reason)
++            blocking = [c for c in check_question(question, self.today) if c.severity == "refuse"]
++            if blocking:
++                reason = " ".join(c.message for c in blocking)
++                sp.set_output({"refusal": reason, "codes": [c.code for c in blocking]})
++                return self._refuse(reason)
+             sp.set_output({"ok": True})
+             return {"question": question}
+ 
+@@ -219,8 +227,21 @@ class _Run:
+                         f"[west, south, east, north], or use a known place: {known}."
+                     )
+                 box = named
++            concerns = check_plan(
++                [(p.start, p.end) for p in plan.periods],
++                box,
++                self.today,
++                change=plan.task == "index_change",
++            )
++            if blocking := [c for c in concerns if c.severity == "refuse"]:
++                sp.set_output({"codes": [c.code for c in blocking]})
++                return self._refuse(" ".join(c.message for c in blocking))
+             blocks = list(state.get("blocks", []))
+             caveats = list(state.get("caveats", []))
++            low_confidence = state.get("low_confidence", False)
++            for concern in concerns:
++                caveats.append(f"Low confidence: {concern.message}")
++                low_confidence = True
+             scenes: list[dict[str, Any]] = []
+             for period in plan.periods:
+                 chosen = None
+@@ -260,6 +281,7 @@ class _Run:
+                 "scenes": scenes,
+                 "blocks": blocks,
+                 "caveats": caveats,
++                "low_confidence": low_confidence,
+             }
+ 
+     async def analyze(self, state: State) -> dict[str, Any]:
+@@ -268,6 +290,7 @@ class _Run:
+             blocks = list(state["blocks"])
+             caveats = list(state["caveats"])
+             analysed: list[ProvenanceBlock] = []
++            low_confidence = state.get("low_confidence", False)
+             for scene in state["scenes"]:
+                 data = await self._tool(
+                     "band_math",
+@@ -276,14 +299,18 @@ class _Run:
+                         "index": plan.index,
+                         "bbox": state["bbox"],
+                         "collection": service.DEFAULT_COLLECTION,
++                        "cloud_mask": "scl",
+                     },
+                 )
+                 block = ProvenanceBlock.model_validate(data["provenance"])
+-                if data["stats"]["mean"] is None:
+-                    return self._refuse(
+-                        f"Scene {scene['item_id']} has no valid pixels over this area."
+-                    )
+                 blocks.append(block)
++                if data["stats"]["mean"] is None:
++                    return {
++                        "blocks": blocks,
++                        **self._refuse(
++                            f"Scene {scene['item_id']} has no valid pixels over this area."
++                        ),
++                    }
+                 analysed.append(block)
+                 if data["grid"]["clipped"]:
+                     caveats.append(
+@@ -295,6 +322,15 @@ class _Run:
+                         f"{negative:.0%} of pixels had slightly negative reflectance "
+                         "and were clipped to zero before computing the index."
+                     )
++                cloudy = data["cloud_masked_fraction"]
++                if cloudy > 0.5:
++                    low_confidence = True
++                    caveats.append(
++                        f"Low confidence: {cloudy:.0%} of the area was cloud, shadow or cirrus and "
++                        "was excluded, so the statistics rest on a minority of the area."
++                    )
++                elif cloudy > 0.2:
++                    caveats.append(f"{cloudy:.0%} of the area was cloudy and was excluded.")
+                 if data["stats"]["valid_fraction"] < 0.8:
+                     caveats.append(
+                         f"Only {data['stats']['valid_fraction']:.0%} of the area had valid pixels."
+@@ -308,7 +344,11 @@ class _Run:
+                         "the difference may be seasonal rather than a real change."
+                     )
+             sp.set_output({"block_ids": [str(b.block_id) for b in analysed]})
+-            return {"blocks": blocks, "caveats": list(dict.fromkeys(caveats))}
++            return {
++                "blocks": blocks,
++                "caveats": list(dict.fromkeys(caveats)),
++                "low_confidence": low_confidence,
++            }
+ 
+     async def check_evidence(self, state: State) -> dict[str, Any]:
+         with self.tracer.span("check_evidence") as sp:
+@@ -392,6 +432,7 @@ class _Run:
+             plan=state.get("plan"),
+             validation_ok=not refused and not state.get("template_used", False),
+             unsupported_numbers=state.get("unsupported", []),
++            confidence="low" if state.get("low_confidence") else "normal",
+             model=self.model.name,
+         )
+         return {"final": final}
+diff --git a/src/geo_evidence_mcp/agent/llm.py b/src/geo_evidence_mcp/agent/llm.py
+index 329a49a..aacd76a 100644
+--- a/src/geo_evidence_mcp/agent/llm.py
++++ b/src/geo_evidence_mcp/agent/llm.py
+@@ -115,6 +115,7 @@ class ScriptedModel:
+         self._plan_for = plan_for
+         self._narrate_with = narrate_with
+         self.narrate_calls = 0
++        self.plan_calls = 0
+         self.feedback_seen: list[str | None] = []
+ 
+     @property
+@@ -122,6 +123,7 @@ class ScriptedModel:
+         return "scripted"
+ 
+     async def plan(self, question: str, *, today: date, known_places: list[str]) -> Plan:
++        self.plan_calls += 1
+         return self._plan_for(question)
+ 
+     async def narrate(self, question: str, evidence: str, *, feedback: str | None) -> str:
+diff --git a/src/geo_evidence_mcp/provenance.py b/src/geo_evidence_mcp/provenance.py
+index 3f6cacf..744d48d 100644
+--- a/src/geo_evidence_mcp/provenance.py
++++ b/src/geo_evidence_mcp/provenance.py
+@@ -73,7 +73,9 @@ class Computation(_Strict):
+     operation: Operation
+     formula: str | None = None
+     parameters: dict[str, Any] = Field(default_factory=dict)
+-    resampling: Literal["none"] = "none"  # all reads are on the native grid
++    # "none": every read is on its native grid. "nearest_scl_to_10m": the 20 m SCL cloud mask is
++    # resampled to the 10 m grid with nearest neighbour; the spectral bands are never resampled.
++    resampling: Literal["none", "nearest_scl_to_10m"] = "none"
+     nodata_policy: str
+ 
+ 
+diff --git a/src/geo_evidence_mcp/raster.py b/src/geo_evidence_mcp/raster.py
+index 32b0bb9..6cf5818 100644
+--- a/src/geo_evidence_mcp/raster.py
++++ b/src/geo_evidence_mcp/raster.py
+@@ -3,11 +3,13 @@
+ from __future__ import annotations
+ 
+ import math
++from collections.abc import Collection
+ from dataclasses import dataclass
+ 
+ import numpy as np
+ import rasterio
+ from affine import Affine
++from rasterio.enums import Resampling
+ from rasterio.warp import transform_bounds
+ from rasterio.windows import Window, from_bounds
+ from rasterio.windows import bounds as window_bounds
+@@ -113,3 +115,27 @@ def load_window(
+     return read_window(
+         ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key, max_pixels=max_pixels
+     )
++
++
++def read_class_mask(href: str, reference: WindowData, classes: Collection[int]) -> np.ndarray:
++    """True where the classification asset (for example SCL, 20 m) holds one of `classes`.
++
++    The asset is resampled to the reference window's grid with nearest neighbour, so each 10 m
++    pixel takes the class of the 20 m cell that contains it. Class 0 (no data) is always True.
++    """
++    with rasterio.Env(**GDAL_ENV), rasterio.open(href) as src:
++        if src.crs.to_string() != reference.crs:
++            raise ValueError(f"{href} is in {src.crs}, expected {reference.crs}")
++        left, bottom, right, top = reference.bounds
++        window = from_bounds(left, bottom, right, top, transform=src.transform)
++        height, width = reference.values.shape
++        data = src.read(
++            1,
++            window=window,
++            out_shape=(height, width),
++            resampling=Resampling.nearest,
++            boundless=True,
++            fill_value=0,
++        )
++    mask: np.ndarray = np.isin(data, [0, *classes])
++    return mask
+diff --git a/src/geo_evidence_mcp/results.py b/src/geo_evidence_mcp/results.py
+index b3a5b88..4a936f7 100644
+--- a/src/geo_evidence_mcp/results.py
++++ b/src/geo_evidence_mcp/results.py
+@@ -48,6 +48,8 @@ class IndexResult(BaseModel):
+     formula: str
+     clip_min: float  # reflectance is clipped to this value before the ratio
+     zone: Literal["bbox", "polygon"]
++    cloud_mask: Literal["scl", "none"]
++    cloud_masked_fraction: float  # share of valid in-zone pixels removed by the SCL cloud mask
+     grid: GridInfo
+     negative_reflectance_fraction: float  # share of in-zone pixels clipped (either band < 0)
+     stats: ZonalStats
+diff --git a/src/geo_evidence_mcp/server.py b/src/geo_evidence_mcp/server.py
+index 20d9c47..eec805a 100644
+--- a/src/geo_evidence_mcp/server.py
++++ b/src/geo_evidence_mcp/server.py
+@@ -31,6 +31,10 @@ BBoxArg = Annotated[
+ ]
+ IndexArg = Annotated[Literal["ndvi", "ndwi"], Field(description="Spectral index to compute")]
+ ItemIdArg = Annotated[str, Field(description="STAC item id, e.g. from search_stac")]
++CloudMaskArg = Annotated[
++    Literal["scl", "none"],
++    Field(description="scl: drop cloud, shadow, cirrus and defective pixels using the SCL layer"),
++]
+ RunIdArg = Annotated[
+     str | None, Field(description="Optional agent run id, stored in the trace to correlate calls")
+ ]
+@@ -120,6 +124,7 @@ def build_server(
+         index: IndexArg,
+         bbox: BBoxArg,
+         collection: str = service.DEFAULT_COLLECTION,
++        cloud_mask: CloudMaskArg = "scl",
+         run_id: RunIdArg = None,
+     ) -> IndexResult:
+         """Compute NDVI or NDWI for a scene over a bounding box, with summary statistics."""
+@@ -129,6 +134,7 @@ def build_server(
+                 index,
+                 bbox=_bbox(bbox),
+                 collection=collection,
++                cloud_mask=cloud_mask,
+                 client=client,
+                 store=blocks,
+                 run_id=run_id,
+@@ -141,6 +147,7 @@ def build_server(
+         index: IndexArg,
+         geometry: GeometryArg,
+         collection: str = service.DEFAULT_COLLECTION,
++        cloud_mask: CloudMaskArg = "scl",
+         run_id: RunIdArg = None,
+     ) -> IndexResult:
+         """Compute NDVI or NDWI statistics inside a polygon (pixel centres inside the polygon)."""
+@@ -150,6 +157,7 @@ def build_server(
+                 index,
+                 geometry=geometry,
+                 collection=collection,
++                cloud_mask=cloud_mask,
+                 client=client,
+                 store=blocks,
+                 run_id=run_id,
+diff --git a/src/geo_evidence_mcp/service.py b/src/geo_evidence_mcp/service.py
+index 6280f6d..7013b86 100644
+--- a/src/geo_evidence_mcp/service.py
++++ b/src/geo_evidence_mcp/service.py
+@@ -22,7 +22,7 @@ from geo_evidence_mcp.provenance import (
+     bbox_polygon,
+     build_block,
+ )
+-from geo_evidence_mcp.raster import WindowData, load_window
++from geo_evidence_mcp.raster import WindowData, load_window, read_class_mask
+ from geo_evidence_mcp.results import (
+     GridInfo,
+     IndexResult,
+@@ -43,6 +43,11 @@ DEFAULT_COLLECTION = "sentinel-2-l2a"
+ MAX_WINDOW_PIXELS = 4_000_000  # about 20 x 20 km at 10 m; larger requests are refused
+ 
+ CLIP_MIN = 0.0
++# Scene Classification Layer classes treated as unusable: 1 saturated/defective, 3 cloud shadow,
++# 8 cloud (medium probability), 9 cloud (high probability), 10 thin cirrus.
++# Class 0 (no data) is always masked as well.
++CLOUD_MASK_CLASSES = (1, 3, 8, 9, 10)
++CloudMask = Literal["scl", "none"]
+ NODATA_POLICY = "pixels equal to the asset nodata value are masked and excluded from statistics"
+ # index -> (formula, first asset, second asset): (first - second) / (first + second)
+ INDICES: dict[str, tuple[str, str, str]] = {
+@@ -258,6 +263,7 @@ def index_stats(
+     bbox: BBox | None = None,
+     geometry: dict[str, Any] | None = None,
+     collection: str = DEFAULT_COLLECTION,
++    cloud_mask: CloudMask = "scl",
+     client: StacClientLike | None = None,
+     store: ProvenanceStore | None = None,
+     run_id: str | None = None,
+@@ -279,6 +285,16 @@ def index_stats(
+ 
+     values = normalized_difference(first.values, second.values, clip_min=CLIP_MIN)
+     inside = zone_mask(values.shape, first.transform, first.crs, geometry)
++    masked_fraction = 0.0
++    if cloud_mask == "scl":
++        if "scl" not in scene.assets:
++            raise ValueError(
++                f"scene {item_id} has no SCL asset; use cloud_mask='none' to skip masking"
++            )
++        cloudy = read_class_mask(scene.assets["scl"].href, first, CLOUD_MASK_CLASSES)
++        usable = inside & ~np.ma.getmaskarray(values)
++        masked_fraction = float((usable & cloudy).sum() / usable.sum()) if usable.any() else 0.0
++        values = np.ma.masked_array(np.ma.getdata(values), mask=np.ma.getmaskarray(values) | cloudy)
+     counted = inside & ~np.ma.getmaskarray(values)
+     negative = (np.ma.getdata(first.values) < 0) | (np.ma.getdata(second.values) < 0)
+     stats = zonal_stats(values, first.transform, first.crs, geometry)
+@@ -286,12 +302,19 @@ def index_stats(
+     grid = _grid(first)
+     zone: Literal["bbox", "polygon"] = "polygon" if geometry is not None else "bbox"
+ 
+-    args: dict[str, Any] = {"item_id": item_id, "index": index, "collection": collection}
++    args: dict[str, Any] = {
++        "item_id": item_id,
++        "index": index,
++        "collection": collection,
++        "cloud_mask": cloud_mask,
++    }
+     args.update({"geometry": geometry} if geometry is not None else {"bbox": list(aoi.as_tuple)})
+     outputs = _stat_outputs(index, stats, "index")
+     outputs.append(
+         Output(name="negative_reflectance_fraction", value=negative_fraction, unit="fraction")
+     )
++    if cloud_mask == "scl":
++        outputs.append(Output(name="cloud_masked_fraction", value=masked_fraction, unit="fraction"))
+     outputs += _grid_outputs(grid)
+     if scene.cloud_cover is not None:
+         outputs.append(
+@@ -300,13 +323,17 @@ def index_stats(
+     block = build_block(
+         tool="zonal_stats" if geometry is not None else "band_math",
+         args=args,
+-        sources=[_source(scene, first_key), _source(scene, second_key)],
++        sources=[_source(scene, first_key), _source(scene, second_key)]
++        + ([_source(scene, "scl")] if cloud_mask == "scl" else []),
+         spatial=_spatial(grid, geometry if geometry is not None else bbox_polygon(aoi)),
+         computation=Computation(
+             operation=index,
++            resampling="nearest_scl_to_10m" if cloud_mask == "scl" else "none",
+             formula=formula,
+             parameters={
+                 "clip_min": CLIP_MIN,
++                "cloud_mask": cloud_mask,
++                "scl_masked_classes": list(CLOUD_MASK_CLASSES) if cloud_mask == "scl" else [],
+                 "zone": zone,
+                 "pixel_inclusion": "pixel centre inside the zone",
+                 "max_window_pixels": MAX_WINDOW_PIXELS,
+@@ -323,6 +350,8 @@ def index_stats(
+         formula=formula,
+         clip_min=CLIP_MIN,
+         zone=zone,
++        cloud_mask=cloud_mask,
++        cloud_masked_fraction=masked_fraction,
+         grid=grid,
+         negative_reflectance_fraction=negative_fraction,
+         stats=stats,
+@@ -372,6 +401,7 @@ def execute(
+             bbox=box,
+             geometry=args.get("geometry"),
+             collection=collection,
++            cloud_mask=args.get("cloud_mask", "none"),  # blocks from before M5 used no mask
+             **common,
+         )
+     raise ValueError(f"cannot replay unknown tool {tool!r}")
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 350dd19..5bc462d 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -43,6 +43,7 @@ class Synthetic:
+     transform: Affine
+     split_col: int
+     hole: tuple[slice, slice]
++    scl: np.ndarray
+ 
+ 
+ def _write(path: Path, data: np.ndarray, transform_: Affine) -> None:
+@@ -69,10 +70,12 @@ def make_scene(
+     when: datetime | None = None,
+     palm_nir: int = PALM_NIR,
+     cloud: float = 1.0,
++    cloud_cells: tuple[slice, slice] | None = None,
++    cloud_dn: int | None = None,
+ ) -> Synthetic:
+     dn = {"red": (1500, 3500), "nir": (palm_nir, 4000), "green": (1800, 3300)}
+     folder = tmp_path / item_id
+-    folder.mkdir(exist_ok=True)
++    folder.mkdir(parents=True, exist_ok=True)
+     (cx,), (cy,) = transform(
+         "EPSG:4326",
+         CRS,
+@@ -92,10 +95,32 @@ def make_scene(
+         data[:, :split_col] = palm
+         if band in ("red", "nir"):
+             data[hole] = 0  # nodata
++            if cloud_cells is not None and cloud_dn is not None:  # bright cloud pixels
++                rows, cols = cloud_cells
++                data[rows.start * 2 : rows.stop * 2, cols.start * 2 : cols.stop * 2] = cloud_dn
+         path = folder / f"{band}.tif"
+         _write(path, data, transform_)
+         assets[band] = AssetRef(href=str(path), scale=1e-4, offset=offset, nodata=0.0)
+ 
++    # Scene classification at 20 m on the same origin: 4 = vegetation, 9 = cloud (high probability).
++    scl = np.full((SIZE // 2, SIZE // 2), 4, dtype="uint8")
++    if cloud_cells is not None:
++        scl[cloud_cells] = 9
++    scl_path = folder / "scl.tif"
++    with rasterio.open(
++        scl_path,
++        "w",
++        driver="GTiff",
++        height=scl.shape[0],
++        width=scl.shape[1],
++        count=1,
++        dtype="uint8",
++        crs=CRS,
++        transform=Affine(20.0, 0.0, x0, 0.0, -20.0, y0),
++        nodata=0,
++    ) as dst:
++        dst.write(scl, 1)
++    assets["scl"] = AssetRef(href=str(scl_path), scale=1.0, offset=0.0, nodata=0.0)
+     scene = SceneSummary(
+         item_id=item_id,
+         collection="sentinel-2-l2a",
+@@ -105,7 +130,7 @@ def make_scene(
+         epsg=32632,
+         assets=assets,
+     )
+-    return Synthetic(scene=scene, transform=transform_, split_col=split_col, hole=hole)
++    return Synthetic(scene=scene, transform=transform_, split_col=split_col, hole=hole, scl=scl)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index df503d4..8e9d0f6 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -302,3 +302,102 @@ def test_plan_validation() -> None:
+         Plan(task="index_change", index="ndvi", place="x", periods=[SEPT_2026, SEPT_2026])
+     plan = Plan(task="index_change", index="ndvi", place="x", periods=[SEPT_2026, SEPT_2025])
+     assert [p.start.year for p in plan.periods] == [2025, 2026]  # sorted chronologically
++
++
++# ---- M5: systematic refusals and low-confidence flags -------------------------------------
++@pytest.mark.req("R3")
++@pytest.mark.parametrize(
++    "question",
++    [
++        "Show me NDVI at 1 m resolution for the Tozeur oasis.",
++        "Forecast the NDVI of the Tozeur oasis for next year.",
++        "What was the temperature in Tozeur in July 2026?",
++        "How many palm trees are in the Tozeur oasis?",
++    ],
++)
++def test_traps_are_refused_before_the_model_is_called(world: World, question: str) -> None:
++    def must_not_plan(_: str) -> Plan:
++        raise AssertionError("the model should not be consulted for a trap")
++
++    model = ScriptedModel(must_not_plan, faithful)
++    answer = world.ask(question, model)
++    assert answer.status == "refused" and model.plan_calls == 0
++    assert answer.block_ids == [] and answer.confidence == "normal"
++
++
++@pytest.mark.req("R3")
++def test_oversized_area_is_refused_before_any_search(world: World) -> None:
++    q = "NDVI of the whole region 8.0,33.0,8.5,33.5 in September 2026?"
++    plan = Plan(task="index_value", index="ndvi", bbox=[8.0, 33.0, 8.5, 33.5], periods=[SEPT_2026])
++    answer = world.ask(q, model_for({q: plan}))
++    assert answer.status == "refused" and "km2" in answer.answer and answer.block_ids == []
++
++
++@pytest.mark.req("R3")
++def test_future_period_chosen_by_the_model_is_still_refused(world: World) -> None:
++    q = "NDVI of the Tozeur oasis in January 2027?"
++    period = Period(start=date(2027, 1, 1), end=date(2027, 1, 31))
++    answer = world.ask(q, model_for({q: value_plan(period=period)}))
++    assert answer.status == "refused" and "future" in answer.answer and answer.block_ids == []
++
++
++@pytest.mark.req("R3")
++def test_tiny_area_is_answered_but_flagged_low_confidence(world: World) -> None:
++    q = "NDVI at 8.1400,33.9000,8.1405,33.9005 in September 2026?"
++    plan = Plan(
++        task="index_value", index="ndvi", bbox=[8.14, 33.9, 8.1405, 33.9005], periods=[SEPT_2026]
++    )
++    answer = world.ask(q, model_for({q: plan}))
++    assert answer.status == "answered" and answer.confidence == "low"
++    assert any(
++        c.startswith("Low confidence:") and "fewer than 100 pixels" in c for c in answer.caveats
++    )
++
++
++def _cloudy_agent_world(tmp_path: Path, fraction: float) -> World:
++    from geo_evidence_mcp.aoi import TOZEUR
++    from geo_evidence_mcp.raster import load_window
++
++    probe = make_scene(tmp_path / "probe")
++    col, _row, width, _height = load_window(probe.scene, "red", TOZEUR).window
++    last = col // 2 + int(width / 2 * fraction)
++    cells = (slice(0, 225), slice(0, last))  # the whole tile's rows, columns up to `last`
++    world = World(tmp_path / "w")
++    cloudy = make_scene(
++        tmp_path / "cloud",
++        item_id="S2_CLOUDY",
++        when=datetime(2026, 9, 20, 10, tzinfo=UTC),
++        cloud_cells=cells,
++        cloud_dn=9000,
++    )
++    world.server = build_server(
++        client=FakeCatalog([scene_to_item(cloudy.scene)]), store=world.store
++    )
++    return world
++
++
++@pytest.mark.req("R3")
++def test_heavy_cloud_cover_lowers_confidence_and_is_explained(tmp_path: Path) -> None:
++    world = _cloudy_agent_world(tmp_path, 0.7)
++    q = "NDVI of the Tozeur oasis in September 2026?"
++    answer = world.ask(q, model_for({q: value_plan()}))
++    assert answer.status == "answered" and answer.confidence == "low"
++    assert any("Low confidence" in c and "cloud, shadow or cirrus" in c for c in answer.caveats)
++
++
++@pytest.mark.req("R3")
++def test_moderate_cloud_cover_is_a_caveat_not_a_low_confidence_flag(tmp_path: Path) -> None:
++    world = _cloudy_agent_world(tmp_path, 0.3)
++    q = "NDVI of the Tozeur oasis in September 2026?"
++    answer = world.ask(q, model_for({q: value_plan()}))
++    assert answer.status == "answered" and answer.confidence == "normal"
++    assert any("was cloudy and was excluded" in c for c in answer.caveats)
++
++
++@pytest.mark.req("R3")
++def test_fully_cloudy_scene_is_refused_with_its_evidence_kept(tmp_path: Path) -> None:
++    world = _cloudy_agent_world(tmp_path, 2.0)
++    q = "NDVI of the Tozeur oasis in September 2026?"
++    answer = world.ask(q, model_for({q: value_plan()}))
++    assert answer.status == "refused" and "no valid pixels" in answer.answer
++    assert len(answer.block_ids) == 2  # the search and the (empty) analysis stay on record
+diff --git a/tests/test_capabilities.py b/tests/test_capabilities.py
+new file mode 100644
+index 0000000..5b7d62c
+--- /dev/null
++++ b/tests/test_capabilities.py
+@@ -0,0 +1,115 @@
++"""R3: deterministic capability checks. Traps are refused without any model call."""
++
++from __future__ import annotations
++
++from datetime import date
++
++import pytest
++
++from geo_evidence_mcp.agent.capabilities import (
++    MAX_AOI_KM2,
++    bbox_area_km2,
++    check_plan,
++    check_question,
++)
++from geo_evidence_mcp.aoi import TOZEUR
++from geo_evidence_mcp.models import BBox
++
++TODAY = date(2026, 11, 14)
++
++TRAPS = {
++    "resolution_too_fine": [
++        "Show me NDVI at 1 m resolution for the Tozeur oasis.",
++        "What is the NDVI of my garden at 50 cm resolution?",
++        "Give me 2 metre per pixel vegetation maps of Tozeur.",
++        "I need sub-metre NDVI for the oasis.",
++        "Can you get centimetre-level accuracy on water extent?",
++        "NDVI with 5 m pixel size please.",
++    ],
++    "future": [
++        "Forecast the NDVI of the Tozeur oasis for next year.",
++        "Will the oasis be greener in 2030?",
++        "Predict vegetation health there in 2027.",
++        "What will the NDVI look like next season?",
++    ],
++    "unsupported_quantity": [
++        "What was the temperature in Tozeur in July 2026?",
++        "How much rainfall did the oasis get in 2025?",
++        "What is the soil moisture in the oasis?",
++        "Estimate the crop yield of the oasis in September 2026.",
++        "What is the population of the Tozeur oasis?",
++        "How bad was the air quality over the oasis?",
++        "What is the elevation of the oasis?",
++        "How much biomass is stored in the palms?",
++    ],
++    "object_counting": [
++        "How many palm trees are in the Tozeur oasis?",
++        "How many buildings are in the oasis?",
++        "How many cars were parked there in September 2026?",
++    ],
++}
++
++LEGITIMATE = [
++    "What was the mean NDVI of the Tozeur oasis in September 2026?",
++    "Compare NDVI between September 2025 and September 2026 in the Tozeur oasis.",
++    "Is there open water in the oasis (NDWI) in September 2026?",
++    "What NDVI do you get at 10 m resolution for Tozeur?",
++    "NDVI for a 500 m wide area near 8.14, 33.9 in 2026.",
++    "How green was the Tozeur oasis in 2024?",
++    "What was the water index in the winter of 2025?",
++    "Will you compare the NDVI of September 2025 and September 2026?",
++    "Which window of 20 m cells shows the highest NDVI?",
++    "Was the oasis greener in 2026 than in 2025?",
++]
++
++
++def codes(question: str) -> set[str]:
++    return {c.code for c in check_question(question, TODAY) if c.severity == "refuse"}
++
++
++@pytest.mark.req("R3")
++@pytest.mark.parametrize(
++    ("code", "question"), [(code, q) for code, qs in TRAPS.items() for q in qs]
++)
++def test_every_trap_is_refused_for_the_right_reason(code: str, question: str) -> None:
++    assert code in codes(question), question
++    assert all(c.message for c in check_question(question, TODAY))
++
++
++@pytest.mark.req("R3")
++@pytest.mark.parametrize("question", LEGITIMATE)
++def test_legitimate_questions_are_not_refused(question: str) -> None:
++    assert codes(question) == set(), question
++
++
++@pytest.mark.req("R3")
++def test_trap_set_is_at_least_twenty_questions() -> None:
++    assert sum(len(v) for v in TRAPS.values()) >= 20
++
++
++def test_area_estimate_is_close_to_geodesic_truth() -> None:
++    assert bbox_area_km2(TOZEUR) == pytest.approx(4.0, rel=0.1)  # about 2 x 2 km
++    assert bbox_area_km2(BBox(west=0, south=0, east=1, north=1)) == pytest.approx(12308, rel=0.01)
++
++
++def plan_codes(
++    period: tuple[date, date], bbox: BBox = TOZEUR, change: bool = False
++) -> dict[str, str]:
++    return {c.code: c.severity for c in check_plan([period], bbox, TODAY, change=change)}
++
++
++@pytest.mark.req("R3")
++def test_plan_checks() -> None:
++    sept = (date(2026, 9, 1), date(2026, 9, 30))
++    assert plan_codes(sept) == {}
++    big = BBox(west=8.0, south=33.0, east=8.5, north=33.5)
++    assert plan_codes(sept, big) == {"area_too_large": "refuse"}
++    assert MAX_AOI_KM2 == 400
++    tiny = BBox(west=8.14, south=33.9, east=8.14001, north=33.90001)
++    assert plan_codes(sept, tiny) == {"area_too_small": "refuse"}
++    small = BBox(west=8.14, south=33.9, east=8.1405, north=33.9005)
++    assert plan_codes(sept, small) == {"few_pixels": "warn"}
++    assert plan_codes((date(2027, 1, 1), date(2027, 1, 31))) == {"future_period": "refuse"}
++    assert plan_codes((date(2010, 1, 1), date(2010, 12, 31))) == {"before_sensor": "refuse"}
++    assert plan_codes((date(2025, 1, 1), date(2026, 6, 1))) == {"long_window": "warn"}
++    assert plan_codes((date(2025, 1, 1), date(2026, 6, 1)), change=True) == {}
+diff --git a/tests/test_scl_mask.py b/tests/test_scl_mask.py
+new file mode 100644
+index 0000000..92c0117
+--- /dev/null
++++ b/tests/test_scl_mask.py
+@@ -0,0 +1,37 @@
++"""R3/R1: cloud masking from the Scene Classification Layer (20 m onto the 10 m grid)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from geo_evidence_mcp.aoi import TOZEUR
++from geo_evidence_mcp.raster import load_window, read_class_mask
++from tests.conftest import make_scene
++
++CLOUD_CLASSES = (1, 3, 8, 9, 10)
++
++
++@pytest.mark.req("R3")
++def test_scl_mask_lines_up_with_the_10m_grid_exactly(tmp_path: Path) -> None:
++    # A block of cloud in 20 m cells; the 10 m window starts at an arbitrary (maybe odd) pixel.
++    cells = (slice(105, 110), slice(100, 108))
++    synthetic = make_scene(tmp_path, cloud_cells=cells)
++    red = load_window(synthetic.scene, "red", TOZEUR)
++    mask = read_class_mask(synthetic.scene.assets["scl"].href, red, CLOUD_CLASSES)
++
++    expected_full = np.kron(synthetic.scl == 9, np.ones((2, 2), dtype=bool))  # 20 m -> 10 m
++    col, row, width, height = red.window
++    expected = expected_full[row : row + height, col : col + width]
++    assert mask.shape == red.values.shape
++    assert mask.sum() > 0
++    assert np.array_equal(mask, expected)
++
++
++@pytest.mark.req("R3")
++def test_clear_scene_masks_nothing(tmp_path: Path) -> None:
++    synthetic = make_scene(tmp_path)
++    red = load_window(synthetic.scene, "red", TOZEUR)
++    assert not read_class_mask(synthetic.scene.assets["scl"].href, red, CLOUD_CLASSES).any()
+diff --git a/tests/test_server.py b/tests/test_server.py
+index 3cc71f4..bfe109b 100644
+--- a/tests/test_server.py
++++ b/tests/test_server.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from pathlib import Path
+ from typing import Any
+ 
+ import pytest
+@@ -101,7 +102,7 @@ def test_band_math_ndvi_over_bbox_lists_both_sources(synthetic: Synthetic) -> No
+         synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
+     )
+     assert out["zone"] == "bbox" and out["formula"] == "(nir - red) / (nir + red)"
+-    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04"]
++    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04", "SCL"]
+     assert out["stats"]["max"] == pytest.approx(0.75, abs=1e-4)
+     assert out["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
+     assert out["negative_reflectance_fraction"] == 0.0
+@@ -197,7 +198,8 @@ def test_every_numeric_tool_returns_a_complete_provenance_block(synthetic: Synth
+             assert src["item_id"] == "SYNTH_TOZEUR_L2A" and src["processing_level"] == "L2A"
+             assert src["processing_baseline"] == "05.11" and src["href"]
+             assert block["spatial"]["crs"] == "EPSG:32632"
+-            assert block["computation"]["resampling"] == "none"
++            expected = "nearest_scl_to_10m" if tool in ("band_math", "zonal_stats") else "none"
++            assert block["computation"]["resampling"] == expected
+     index = results["band_math"]["provenance"]["computation"]
+     assert (
+         index["parameters"]["clip_min"] == 0.0 and index["formula"] == "(nir - red) / (nir + red)"
+@@ -293,3 +295,93 @@ def test_real_stdio_entrypoint_starts_and_answers() -> None:
+     names, health = asyncio.run(run())
+     assert names == EXPECTED_TOOLS
+     assert health["status"] == "ok"
++
++
++def _cloudy_world(tmp_path: Path) -> tuple[Synthetic, int]:
++    """A scene whose desert side holds a block of bright cloud: 5 x 8 SCL cells = 160 pixels."""
++    from geo_evidence_mcp.aoi import TOZEUR
++    from geo_evidence_mcp.raster import load_window
++    from tests.conftest import make_scene
++
++    probe = make_scene(tmp_path / "probe")
++    col, row, _, _ = load_window(probe.scene, "red", TOZEUR).window
++    cells = (slice(row // 2 + 20, row // 2 + 25), slice(col // 2 + 60, col // 2 + 68))
++    cloudy = make_scene(tmp_path / "cloudy", cloud_cells=cells, cloud_dn=9000)
++    return cloudy, 5 * 8 * 4
++
++
++@pytest.mark.req("R3")
++def test_cloud_mask_removes_cloudy_pixels_and_reports_how_many(tmp_path: Path) -> None:
++    synthetic, cloudy_pixels = _cloudy_world(tmp_path)
++    args = {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
++    masked = call(synthetic, "band_math", args)
++    raw = call(synthetic, "band_math", {**args, "cloud_mask": "none"})
++
++    total, hole = raw["stats"]["total_pixels"], 25
++    assert raw["stats"]["valid_pixels"] == total - hole
++    assert masked["stats"]["valid_pixels"] == total - hole - cloudy_pixels
++    assert masked["cloud_masked_fraction"] == pytest.approx(cloudy_pixels / (total - hole))
++    assert masked["cloud_mask"] == "scl" and raw["cloud_mask"] == "none"
++    # Bright cloud (red = nir) has NDVI 0: it drags the minimum down unless it is masked out.
++    assert raw["stats"]["min"] == pytest.approx(0.0, abs=1e-6)
++    assert masked["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
++    # The mask is part of the recorded call and of the evidence.
++    params = masked["provenance"]["computation"]["parameters"]
++    assert params["cloud_mask"] == "scl" and params["scl_masked_classes"] == [1, 3, 8, 9, 10]
++    assert masked["provenance"]["computation"]["resampling"] == "nearest_scl_to_10m"
++    assert masked["provenance"]["request"]["args"]["cloud_mask"] == "scl"
++    names = {o["name"] for o in masked["provenance"]["outputs"]}
++    assert "cloud_masked_fraction" in names and "cloud_masked_fraction" not in {
++        o["name"] for o in raw["provenance"]["outputs"]
++    }
++
++
++@pytest.mark.req("R5")
++def test_replay_reproduces_a_masked_calculation(tmp_path: Path) -> None:
++    synthetic, _ = _cloudy_world(tmp_path)
++    store = MemoryStore()
++    out = call(
++        synthetic,
++        "band_math",
++        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
++        store=store,
++    )
++    report = call(
++        synthetic,
++        "get_provenance",
++        {"block_id": out["provenance"]["block_id"], "replay": True},
++        store=store,
++    )["replay"]
++    assert report["matches"] is True
++
++
++@pytest.mark.req("R5")
++def test_blocks_recorded_before_masking_existed_replay_without_a_mask(synthetic: Synthetic) -> None:
++    from geo_evidence_mcp import service
++
++    legacy_args = {
++        "item_id": "SYNTH_TOZEUR_L2A",
++        "index": "ndvi",
++        "bbox": AOI,
++        "collection": "sentinel-2-l2a",
++    }
++    result = service.execute(
++        "band_math", legacy_args, client=FakeCatalog([scene_to_item(synthetic.scene)])
++    )
++    assert result.provenance.computation.parameters["cloud_mask"] == "none"
++
++
++@pytest.mark.req("R3")
++def test_scene_without_scl_gives_a_readable_error(synthetic: Synthetic) -> None:
++    item = scene_to_item(synthetic.scene)
++    del item.assets["scl"]
++    server = build_server(client=FakeCatalog([item]), store=MemoryStore())
++
++    async def run() -> None:
++        async with Client(server) as client:
++            await client.call_tool(
++                "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
++            )
++
++    with pytest.raises(ToolError, match="no SCL asset"):
++        asyncio.run(run())

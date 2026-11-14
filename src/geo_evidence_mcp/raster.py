@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from dataclasses import dataclass
 
 import numpy as np
 import rasterio
 from affine import Affine
+from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window, from_bounds
 from rasterio.windows import bounds as window_bounds
@@ -113,3 +115,27 @@ def load_window(
     return read_window(
         ref.href, ref, bbox, item_id=scene.item_id, asset_key=asset_key, max_pixels=max_pixels
     )
+
+
+def read_class_mask(href: str, reference: WindowData, classes: Collection[int]) -> np.ndarray:
+    """True where the classification asset (for example SCL, 20 m) holds one of `classes`.
+
+    The asset is resampled to the reference window's grid with nearest neighbour, so each 10 m
+    pixel takes the class of the 20 m cell that contains it. Class 0 (no data) is always True.
+    """
+    with rasterio.Env(**GDAL_ENV), rasterio.open(href) as src:
+        if src.crs.to_string() != reference.crs:
+            raise ValueError(f"{href} is in {src.crs}, expected {reference.crs}")
+        left, bottom, right, top = reference.bounds
+        window = from_bounds(left, bottom, right, top, transform=src.transform)
+        height, width = reference.values.shape
+        data = src.read(
+            1,
+            window=window,
+            out_shape=(height, width),
+            resampling=Resampling.nearest,
+            boundless=True,
+            fill_value=0,
+        )
+    mask: np.ndarray = np.isin(data, [0, *classes])
+    return mask

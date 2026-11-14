@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -101,7 +102,7 @@ def test_band_math_ndvi_over_bbox_lists_both_sources(synthetic: Synthetic) -> No
         synthetic, "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
     )
     assert out["zone"] == "bbox" and out["formula"] == "(nir - red) / (nir + red)"
-    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04"]
+    assert [s["band"] for s in out["provenance"]["sources"]] == ["B08", "B04", "SCL"]
     assert out["stats"]["max"] == pytest.approx(0.75, abs=1e-4)
     assert out["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
     assert out["negative_reflectance_fraction"] == 0.0
@@ -197,7 +198,8 @@ def test_every_numeric_tool_returns_a_complete_provenance_block(synthetic: Synth
             assert src["item_id"] == "SYNTH_TOZEUR_L2A" and src["processing_level"] == "L2A"
             assert src["processing_baseline"] == "05.11" and src["href"]
             assert block["spatial"]["crs"] == "EPSG:32632"
-            assert block["computation"]["resampling"] == "none"
+            expected = "nearest_scl_to_10m" if tool in ("band_math", "zonal_stats") else "none"
+            assert block["computation"]["resampling"] == expected
     index = results["band_math"]["provenance"]["computation"]
     assert (
         index["parameters"]["clip_min"] == 0.0 and index["formula"] == "(nir - red) / (nir + red)"
@@ -293,3 +295,93 @@ def test_real_stdio_entrypoint_starts_and_answers() -> None:
     names, health = asyncio.run(run())
     assert names == EXPECTED_TOOLS
     assert health["status"] == "ok"
+
+
+def _cloudy_world(tmp_path: Path) -> tuple[Synthetic, int]:
+    """A scene whose desert side holds a block of bright cloud: 5 x 8 SCL cells = 160 pixels."""
+    from geo_evidence_mcp.aoi import TOZEUR
+    from geo_evidence_mcp.raster import load_window
+    from tests.conftest import make_scene
+
+    probe = make_scene(tmp_path / "probe")
+    col, row, _, _ = load_window(probe.scene, "red", TOZEUR).window
+    cells = (slice(row // 2 + 20, row // 2 + 25), slice(col // 2 + 60, col // 2 + 68))
+    cloudy = make_scene(tmp_path / "cloudy", cloud_cells=cells, cloud_dn=9000)
+    return cloudy, 5 * 8 * 4
+
+
+@pytest.mark.req("R3")
+def test_cloud_mask_removes_cloudy_pixels_and_reports_how_many(tmp_path: Path) -> None:
+    synthetic, cloudy_pixels = _cloudy_world(tmp_path)
+    args = {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
+    masked = call(synthetic, "band_math", args)
+    raw = call(synthetic, "band_math", {**args, "cloud_mask": "none"})
+
+    total, hole = raw["stats"]["total_pixels"], 25
+    assert raw["stats"]["valid_pixels"] == total - hole
+    assert masked["stats"]["valid_pixels"] == total - hole - cloudy_pixels
+    assert masked["cloud_masked_fraction"] == pytest.approx(cloudy_pixels / (total - hole))
+    assert masked["cloud_mask"] == "scl" and raw["cloud_mask"] == "none"
+    # Bright cloud (red = nir) has NDVI 0: it drags the minimum down unless it is masked out.
+    assert raw["stats"]["min"] == pytest.approx(0.0, abs=1e-6)
+    assert masked["stats"]["min"] == pytest.approx(0.05 / 0.55, abs=1e-4)
+    # The mask is part of the recorded call and of the evidence.
+    params = masked["provenance"]["computation"]["parameters"]
+    assert params["cloud_mask"] == "scl" and params["scl_masked_classes"] == [1, 3, 8, 9, 10]
+    assert masked["provenance"]["computation"]["resampling"] == "nearest_scl_to_10m"
+    assert masked["provenance"]["request"]["args"]["cloud_mask"] == "scl"
+    names = {o["name"] for o in masked["provenance"]["outputs"]}
+    assert "cloud_masked_fraction" in names and "cloud_masked_fraction" not in {
+        o["name"] for o in raw["provenance"]["outputs"]
+    }
+
+
+@pytest.mark.req("R5")
+def test_replay_reproduces_a_masked_calculation(tmp_path: Path) -> None:
+    synthetic, _ = _cloudy_world(tmp_path)
+    store = MemoryStore()
+    out = call(
+        synthetic,
+        "band_math",
+        {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI},
+        store=store,
+    )
+    report = call(
+        synthetic,
+        "get_provenance",
+        {"block_id": out["provenance"]["block_id"], "replay": True},
+        store=store,
+    )["replay"]
+    assert report["matches"] is True
+
+
+@pytest.mark.req("R5")
+def test_blocks_recorded_before_masking_existed_replay_without_a_mask(synthetic: Synthetic) -> None:
+    from geo_evidence_mcp import service
+
+    legacy_args = {
+        "item_id": "SYNTH_TOZEUR_L2A",
+        "index": "ndvi",
+        "bbox": AOI,
+        "collection": "sentinel-2-l2a",
+    }
+    result = service.execute(
+        "band_math", legacy_args, client=FakeCatalog([scene_to_item(synthetic.scene)])
+    )
+    assert result.provenance.computation.parameters["cloud_mask"] == "none"
+
+
+@pytest.mark.req("R3")
+def test_scene_without_scl_gives_a_readable_error(synthetic: Synthetic) -> None:
+    item = scene_to_item(synthetic.scene)
+    del item.assets["scl"]
+    server = build_server(client=FakeCatalog([item]), store=MemoryStore())
+
+    async def run() -> None:
+        async with Client(server) as client:
+            await client.call_tool(
+                "band_math", {"item_id": "SYNTH_TOZEUR_L2A", "index": "ndvi", "bbox": AOI}
+            )
+
+    with pytest.raises(ToolError, match="no SCL asset"):
+        asyncio.run(run())

@@ -22,7 +22,7 @@ from geo_evidence_mcp.provenance import (
     bbox_polygon,
     build_block,
 )
-from geo_evidence_mcp.raster import WindowData, load_window
+from geo_evidence_mcp.raster import WindowData, load_window, read_class_mask
 from geo_evidence_mcp.results import (
     GridInfo,
     IndexResult,
@@ -43,6 +43,11 @@ DEFAULT_COLLECTION = "sentinel-2-l2a"
 MAX_WINDOW_PIXELS = 4_000_000  # about 20 x 20 km at 10 m; larger requests are refused
 
 CLIP_MIN = 0.0
+# Scene Classification Layer classes treated as unusable: 1 saturated/defective, 3 cloud shadow,
+# 8 cloud (medium probability), 9 cloud (high probability), 10 thin cirrus.
+# Class 0 (no data) is always masked as well.
+CLOUD_MASK_CLASSES = (1, 3, 8, 9, 10)
+CloudMask = Literal["scl", "none"]
 NODATA_POLICY = "pixels equal to the asset nodata value are masked and excluded from statistics"
 # index -> (formula, first asset, second asset): (first - second) / (first + second)
 INDICES: dict[str, tuple[str, str, str]] = {
@@ -258,6 +263,7 @@ def index_stats(
     bbox: BBox | None = None,
     geometry: dict[str, Any] | None = None,
     collection: str = DEFAULT_COLLECTION,
+    cloud_mask: CloudMask = "scl",
     client: StacClientLike | None = None,
     store: ProvenanceStore | None = None,
     run_id: str | None = None,
@@ -279,6 +285,16 @@ def index_stats(
 
     values = normalized_difference(first.values, second.values, clip_min=CLIP_MIN)
     inside = zone_mask(values.shape, first.transform, first.crs, geometry)
+    masked_fraction = 0.0
+    if cloud_mask == "scl":
+        if "scl" not in scene.assets:
+            raise ValueError(
+                f"scene {item_id} has no SCL asset; use cloud_mask='none' to skip masking"
+            )
+        cloudy = read_class_mask(scene.assets["scl"].href, first, CLOUD_MASK_CLASSES)
+        usable = inside & ~np.ma.getmaskarray(values)
+        masked_fraction = float((usable & cloudy).sum() / usable.sum()) if usable.any() else 0.0
+        values = np.ma.masked_array(np.ma.getdata(values), mask=np.ma.getmaskarray(values) | cloudy)
     counted = inside & ~np.ma.getmaskarray(values)
     negative = (np.ma.getdata(first.values) < 0) | (np.ma.getdata(second.values) < 0)
     stats = zonal_stats(values, first.transform, first.crs, geometry)
@@ -286,12 +302,19 @@ def index_stats(
     grid = _grid(first)
     zone: Literal["bbox", "polygon"] = "polygon" if geometry is not None else "bbox"
 
-    args: dict[str, Any] = {"item_id": item_id, "index": index, "collection": collection}
+    args: dict[str, Any] = {
+        "item_id": item_id,
+        "index": index,
+        "collection": collection,
+        "cloud_mask": cloud_mask,
+    }
     args.update({"geometry": geometry} if geometry is not None else {"bbox": list(aoi.as_tuple)})
     outputs = _stat_outputs(index, stats, "index")
     outputs.append(
         Output(name="negative_reflectance_fraction", value=negative_fraction, unit="fraction")
     )
+    if cloud_mask == "scl":
+        outputs.append(Output(name="cloud_masked_fraction", value=masked_fraction, unit="fraction"))
     outputs += _grid_outputs(grid)
     if scene.cloud_cover is not None:
         outputs.append(
@@ -300,13 +323,17 @@ def index_stats(
     block = build_block(
         tool="zonal_stats" if geometry is not None else "band_math",
         args=args,
-        sources=[_source(scene, first_key), _source(scene, second_key)],
+        sources=[_source(scene, first_key), _source(scene, second_key)]
+        + ([_source(scene, "scl")] if cloud_mask == "scl" else []),
         spatial=_spatial(grid, geometry if geometry is not None else bbox_polygon(aoi)),
         computation=Computation(
             operation=index,
+            resampling="nearest_scl_to_10m" if cloud_mask == "scl" else "none",
             formula=formula,
             parameters={
                 "clip_min": CLIP_MIN,
+                "cloud_mask": cloud_mask,
+                "scl_masked_classes": list(CLOUD_MASK_CLASSES) if cloud_mask == "scl" else [],
                 "zone": zone,
                 "pixel_inclusion": "pixel centre inside the zone",
                 "max_window_pixels": MAX_WINDOW_PIXELS,
@@ -323,6 +350,8 @@ def index_stats(
         formula=formula,
         clip_min=CLIP_MIN,
         zone=zone,
+        cloud_mask=cloud_mask,
+        cloud_masked_fraction=masked_fraction,
         grid=grid,
         negative_reflectance_fraction=negative_fraction,
         stats=stats,
@@ -372,6 +401,7 @@ def execute(
             bbox=box,
             geometry=args.get("geometry"),
             collection=collection,
+            cloud_mask=args.get("cloud_mask", "none"),  # blocks from before M5 used no mask
             **common,
         )
     raise ValueError(f"cannot replay unknown tool {tool!r}")

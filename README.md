@@ -4,7 +4,7 @@ An MCP server and agent for Earth-observation questions where **every numeric an
 machine-checkable provenance**: STAC item, collection, band, CRS, acquisition time, processing level
 and a replayable tool-call trace.
 
-Status: **M4 agent**. The refusal logic (M5) and the benchmark (M6) are not built yet.
+Status: **M5 refusals and cloud masking**. The benchmark (M6) and the comparison run (M7) are not built yet.
 
 | Milestone | Scope | State |
 |---|---|---|
@@ -13,7 +13,7 @@ Status: **M4 agent**. The refusal logic (M5) and the benchmark (M6) are not buil
 | M2 | FastMCP server (`health`, `search_stac`, `load_window`, `band_math`, `zonal_stats`) | done; live MCP test passed |
 | M3 | Provenance block, PostGIS storage, `get_provenance` + replay, claim validator | code + tests done (PostgreSQL tested here); CI database job PENDING |
 | M4 | LangGraph agent (scripted-model tests) + Langfuse tracing adapter | code + offline tests done; live Claude run PENDING |
-| M5 | Refusal / low-confidence logic | pending |
+| M5 | Deterministic refusals, low-confidence flags, SCL cloud masking | code + offline tests done |
 | M6 | Benchmark + eval runner | pending |
 | M7 | Naive vs provenance comparison | pending |
 | M8 | Polish, demo, v0.1.0 | pending |

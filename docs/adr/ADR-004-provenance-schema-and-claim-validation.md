@@ -19,6 +19,9 @@ EPSG:4326, resolution, size, clipped), `computation` (operation, formula, parame
 nodata policy), `outputs` (named, typed, unit-tagged numbers) and `tool_trace` (trace id, span id,
 optional agent run id, start, duration).
 
+M5 amendment: `computation.resampling` may be `nearest_scl_to_10m` when the SCL cloud mask is used
+(ADR-006); the schema file was regenerated.
+
 **Hash.** `args_hash` is SHA-256 over canonical JSON of `{tool, args}` (sorted keys, floats rounded
 to 6 decimals), so key order and float noise do not change it.
 
