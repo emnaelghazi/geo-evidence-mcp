@@ -80,3 +80,34 @@ def test_live_mcp_tools_end_to_end() -> None:
     assert out["sources"][0]["href"].startswith("https://"), "fetch_scene by id may be unsupported"
     assert -1.0 <= out["stats"]["min"] <= out["stats"]["max"] <= 1.0
     assert out["stats"]["valid_fraction"] > 0.8
+
+
+@pytest.mark.req("R2")
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="needs ANTHROPIC_API_KEY")
+def test_live_agent_answers_a_real_question_with_verified_numbers() -> None:
+    """Claude plans and narrates; real Sentinel-2 data; the validator must pass."""
+    import asyncio
+
+    from geo_evidence_mcp.agent.graph import run_agent
+    from geo_evidence_mcp.agent.llm import AnthropicModel
+    from geo_evidence_mcp.config import get_settings
+    from geo_evidence_mcp.server import build_server
+    from geo_evidence_mcp.store import MemoryStore
+
+    settings = get_settings()
+    assert settings.anthropic_api_key is not None
+    store = MemoryStore()
+    model = AnthropicModel(
+        api_key=settings.anthropic_api_key.get_secret_value(), model=settings.anthropic_model
+    )
+    answer = asyncio.run(
+        run_agent(
+            "What was the mean NDVI of the Tozeur oasis in September 2026?",
+            model=model,
+            server=build_server(store=store),
+            store=store,
+        )
+    )
+    print(answer.render())
+    assert answer.status in ("answered", "answered_from_template"), answer.answer
+    assert answer.evidence and answer.block_ids

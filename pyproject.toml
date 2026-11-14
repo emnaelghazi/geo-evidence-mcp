@@ -28,6 +28,9 @@ dependencies = [
   "pystac-client==0.9.1",
   "fastmcp==2.14.7",
   "psycopg[binary]==3.3.8",
+  "langgraph==1.2.20",
+  "anthropic==2.8.0",
+  "langfuse==5.2.0",
   "affine==3.0.1",
 ]
 
@@ -36,6 +39,7 @@ gem-init-env = "geo_evidence_mcp.init_env:main"
 gem-m1-check = "geo_evidence_mcp.m1_check:main"
 gem-mcp = "geo_evidence_mcp.server:main"
 gem-export-schema = "geo_evidence_mcp.export_schema:main"
+gem-ask = "geo_evidence_mcp.agent.ask:main"
 
 [dependency-groups]
 dev = [

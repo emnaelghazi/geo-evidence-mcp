@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +34,7 @@ from geo_evidence_mcp.models import AssetRef, SceneSummary
 
 CRS = "EPSG:32632"
 SIZE = 450  # pixels per side (4.5 km), larger than the ~2 km AOI
-DN = {
-    "red": (1500, 3500),
-    "nir": (4500, 4000),
-    "green": (1800, 3300),
-}
+PALM_NIR = 4500
 
 
 @dataclass(frozen=True)
@@ -65,7 +61,18 @@ def _write(path: Path, data: np.ndarray, transform_: Affine) -> None:
         dst.write(data, 1)
 
 
-def make_scene(tmp_path: Path, *, offset: float = -0.1) -> Synthetic:
+def make_scene(
+    tmp_path: Path,
+    *,
+    offset: float = -0.1,
+    item_id: str = "SYNTH_TOZEUR_L2A",
+    when: datetime | None = None,
+    palm_nir: int = PALM_NIR,
+    cloud: float = 1.0,
+) -> Synthetic:
+    dn = {"red": (1500, 3500), "nir": (palm_nir, 4000), "green": (1800, 3300)}
+    folder = tmp_path / item_id
+    folder.mkdir(exist_ok=True)
     (cx,), (cy,) = transform(
         "EPSG:4326",
         CRS,
@@ -80,20 +87,20 @@ def make_scene(tmp_path: Path, *, offset: float = -0.1) -> Synthetic:
     hole = (slice(centre_row - 2, centre_row + 3), slice(split_col - 30, split_col - 25))
 
     assets: dict[str, AssetRef] = {}
-    for band, (palm, desert) in DN.items():
+    for band, (palm, desert) in dn.items():
         data = np.full((SIZE, SIZE), desert, dtype="uint16")
         data[:, :split_col] = palm
         if band in ("red", "nir"):
             data[hole] = 0  # nodata
-        path = tmp_path / f"{band}.tif"
+        path = folder / f"{band}.tif"
         _write(path, data, transform_)
         assets[band] = AssetRef(href=str(path), scale=1e-4, offset=offset, nodata=0.0)
 
     scene = SceneSummary(
-        item_id="SYNTH_TOZEUR_L2A",
+        item_id=item_id,
         collection="sentinel-2-l2a",
-        datetime=datetime(2026, 9, 15, 10, 0, tzinfo=UTC),
-        cloud_cover=1.0,
+        datetime=when or datetime(2026, 9, 15, 10, 0, tzinfo=UTC),
+        cloud_cover=cloud,
         processing_baseline="05.11",
         epsg=32632,
         assets=assets,
@@ -152,4 +159,8 @@ class FakeCatalog:
     def search(self, **kwargs: Any) -> _FakeSearch:
         ids = kwargs.get("ids")
         found = [i for i in self._items if ids is None or i.id in ids]
+        window = kwargs.get("datetime")
+        if window:
+            start, end = (date.fromisoformat(part) for part in window.split("/"))
+            found = [i for i in found if i.datetime and start <= i.datetime.date() <= end]
         return _FakeSearch(found)
