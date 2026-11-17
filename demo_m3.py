@@ -13,8 +13,7 @@ BBOX = list(TOZEUR.as_tuple)
 async def main():
     async with Client(build_server()) as c:
         found = await c.call_tool(
-            "search_stac", 
-            {"bbox": BBOX, "start": "2026-08-01", "end": "2026-11-10"}
+            "search_stac", {"bbox": BBOX, "start": "2026-08-01", "end": "2026-11-10"}
         )
         ids = [s["item_id"] for s in found.structured_content["scenes"]][:2]
         blocks = []
@@ -28,5 +27,6 @@ async def main():
     for text in (good, bad):
         report = validate_claims(text, blocks)
         print(report.ok, report.unsupported)
+
 
 asyncio.run(main())
