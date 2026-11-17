@@ -46,7 +46,7 @@ def test_make_tracer_uses_langfuse_only_when_both_keys_are_set(monkeypatch) -> N
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
 
     assert isinstance(make_tracer(Settings(_env_file=None)), NullTracer)
-    
+
     only_public = Settings(_env_file=None, langfuse_public_key="pk", langfuse_secret_key=None)
     assert isinstance(make_tracer(only_public), NullTracer)
 

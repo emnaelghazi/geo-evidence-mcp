@@ -10,6 +10,7 @@ from geo_evidence_mcp.validator import validate_claims
 
 BBOX = list(TOZEUR.as_tuple)
 
+
 async def main():
     async with Client(build_server()) as c:
         found = await c.call_tool(
