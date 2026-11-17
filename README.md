@@ -5,6 +5,7 @@ questions about Sentinel-2 imagery, where every number carries machine-checkable
 verified before it reaches the user.
 
 <img width="1080" height="1350" alt="status-m5" src="https://github.com/user-attachments/assets/1a26416c-f931-4055-894f-c655f1beaece" />
+
 ## The problem
 
 An EO agent says *"NDVI dropped 0.3 in this zone."* Which scene? Which band? Which tool call? What
