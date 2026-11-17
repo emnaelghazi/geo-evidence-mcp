@@ -5,7 +5,7 @@ services:
   db:
     build:
       context: ./docker/postgis-pgvector
-    image: geo-evidence-mcp/postgis-pgvector:16-3.4-0.7.4
+    image: geo-evidence-mcp/postgis-pgvector:pg16-bookworm-pgvector-0.7.4
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-gem}

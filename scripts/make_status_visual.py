@@ -281,7 +281,7 @@ def build(out: Path, ndvi_path: Path | None) -> None:
     py = card_y + card_h + 42
     c.text(60, py, "Verified, not assumed", 25, INK, "bold")
     tiles = [
-        ("6 / 6", "pixel values match an independent GDAL read, exactly"),
+        ("6 / 6", "pixel values match an independent read of the raw files"),
         (
             "\u22126.7 to 14.7",
             "NDVI range until negative reflectance (38% of pixels) was handled; now within \u00b11",

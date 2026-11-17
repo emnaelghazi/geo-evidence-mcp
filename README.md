@@ -43,7 +43,7 @@ flowchart LR
 
 | Claim | Status |
 |---|---|
-| Data layer matches raw Sentinel-2 pixel values (Tozeur oasis, scene `S2C_32SMC_20260904_0_L2A`) | Verified: 6/6 values equal an independent GDAL read. Evidence: [`docs/evidence/`](docs/evidence/) |
+| Data layer matches raw Sentinel-2 pixel values (Tozeur oasis, scene `S2C_32SMC_20260904_0_L2A`) | Verified: 6/6 values equal an independent read of the raw files. Evidence: [`docs/evidence/`](docs/evidence/) |
 | MCP tools work against the live Earth Search catalog | Verified by the opt-in integration tests |
 | 150+ automated tests, `mypy --strict`, ruff | Passing |
 | PostGIS storage and replay | Tested against PostgreSQL 16 + PostGIS 3.4; Docker image build in CI pending |

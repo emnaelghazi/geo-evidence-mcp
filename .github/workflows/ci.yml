@@ -39,7 +39,7 @@ jobs:
           docker compose exec -T db psql -U gem -d gem -tA -c \
             "select extname || ' ' || extversion from pg_extension where extname in ('postgis','vector') order by 1" \
             | tee /tmp/ext.txt
-          grep -q '^postgis 3\.4' /tmp/ext.txt
+          grep -q '^postgis 3\.' /tmp/ext.txt
           grep -q '^vector 0\.7' /tmp/ext.txt
       - name: Provenance store tests against the real image
         run: |

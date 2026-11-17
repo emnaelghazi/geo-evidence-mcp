@@ -14,7 +14,11 @@ a naive one (see the project brief, requirements R1-R17).
 - Python 3.12+ (deviation from the brief's 3.11+: `rasterio==1.5.2` requires >=3.12, verified by
   dependency resolution on 2026-11-11), `uv` for environments and lockfile, `ruff` + `mypy --strict` + `pre-commit`.
 - All dependencies pinned exactly in `pyproject.toml`, added in the milestone that first uses them.
-- PostgreSQL 16 + PostGIS 3.4 + pgvector built from tag `v0.7.4` (one image, `docker/postgis-pgvector`).
+- PostgreSQL 16 + PostGIS 3.x + pgvector built from tag `v0.7.4` (one image, `docker/postgis-pgvector`).
+  The image is built from `postgres:16-bookworm` with PostGIS from PGDG: the original base
+  `postgis/postgis:16-3.4` is Debian bullseye, whose PGDG repository was removed, which broke the
+  CI build on 2026-11-15. PostGIS therefore follows what PGDG ships for PostgreSQL 16 (3.4 in the
+  development environment); CI asserts 3.x, not a minor version.
 - Langfuse self-hosted from a trimmed copy of the upstream compose file (v4 image line).
 - Config only through environment variables (`pydantic-settings`); `make init` generates all secrets
   into an untracked `.env`.
