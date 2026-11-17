@@ -40,8 +40,7 @@ def test_null_tracer_accepts_everything() -> None:
 
 
 @pytest.mark.req("R11")
-def test_make_tracer_uses_langfuse_only_when_both_keys_are_set(monkeypatch) -> None:
-    # Ensure system environment variables don't leak into the test
+def test_make_tracer_uses_langfuse_only_when_both_keys_are_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
 
