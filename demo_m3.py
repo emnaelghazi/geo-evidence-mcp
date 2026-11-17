@@ -1,6 +1,8 @@
 import asyncio
-import geo_evidence_mcp  # noqa: F401  (applies the PROJ fix)
+
 from fastmcp import Client
+
+import geo_evidence_mcp  # noqa: F401  (applies the PROJ fix)
 from geo_evidence_mcp.aoi import TOZEUR
 from geo_evidence_mcp.provenance import ProvenanceBlock
 from geo_evidence_mcp.server import build_server
@@ -10,7 +12,10 @@ BBOX = list(TOZEUR.as_tuple)
 
 async def main():
     async with Client(build_server()) as c:
-        found = await c.call_tool("search_stac", {"bbox": BBOX, "start": "2026-08-01", "end": "2026-11-10"})
+        found = await c.call_tool(
+            "search_stac", 
+            {"bbox": BBOX, "start": "2026-08-01", "end": "2026-11-10"}
+        )
         ids = [s["item_id"] for s in found.structured_content["scenes"]][:2]
         blocks = []
         for item in ids:
